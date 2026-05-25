@@ -42,9 +42,10 @@ class Settings:
     db_user: str
     db_password: str
     db_name: str
+    account_alias: str | None = None
 
     @classmethod
-    def load(cls, explicit_env_file: str | None = None) -> "Settings":
+    def load(cls, explicit_env_file: str | None = None, require_kis: bool = True) -> "Settings":
         env_path = _discover_env_file(explicit_env_file)
         if env_path:
             load_dotenv(env_path, override=False)
@@ -81,8 +82,9 @@ class Settings:
         db_user = os.getenv("SYSTEM_TRADE_DB_USER", "root").strip()
         db_password = os.getenv("SYSTEM_TRADE_DB_PASSWORD", "")
         db_name = os.getenv("SYSTEM_TRADE_DB_NAME", "trade").strip()
+        account_alias = (os.getenv("SYSTEM_TRADE_ACCOUNT_ALIAS") or os.getenv("KIS_ACCOUNT_ALIAS") or "").strip() or None
 
-        if not kis_app_key or not kis_app_secret:
+        if require_kis and (not kis_app_key or not kis_app_secret):
             raise ConfigError("KIS_APP_KEY and KIS_APP_SECRET are required.")
 
         return cls(
@@ -97,6 +99,7 @@ class Settings:
             db_user=db_user,
             db_password=db_password,
             db_name=db_name,
+            account_alias=account_alias,
         )
 
     def require_account(self) -> None:
@@ -106,9 +109,15 @@ class Settings:
     def migration_path(self) -> Path:
         return Path(__file__).resolve().parent.parent / "migrations" / "001_init.sql"
 
+    def migration_paths(self) -> list[Path]:
+        migration_dir = Path(__file__).resolve().parent.parent / "migrations"
+        return sorted(migration_dir.glob("*.sql"))
+
 
 def _discover_env_file(explicit_env_file: str | None) -> str:
-    if explicit_env_file:
+    if explicit_env_file is not None:
+        if explicit_env_file.strip() == "":
+            return ""
         explicit = Path(explicit_env_file).expanduser().resolve()
         return str(explicit) if explicit.exists() else ""
 

@@ -23,3 +23,24 @@ def test_settings_parses_full_account_value(monkeypatch) -> None:
 
     assert settings.kis_account_no == "63611886"
     assert settings.kis_acnt_prdt == "01"
+
+
+def test_settings_can_load_db_only_without_kis(monkeypatch) -> None:
+    monkeypatch.delenv("KIS_APP_KEY", raising=False)
+    monkeypatch.delenv("KIS_APP_SECRET", raising=False)
+    monkeypatch.setenv("SYSTEM_TRADE_DB_NAME", "trade")
+
+    settings = Settings.load("", require_kis=False)
+
+    assert settings.db_name == "trade"
+    assert settings.kis_app_key == ""
+
+
+def test_settings_loads_account_alias(monkeypatch) -> None:
+    monkeypatch.setenv("KIS_APP_KEY", "key")
+    monkeypatch.setenv("KIS_APP_SECRET", "secret")
+    monkeypatch.setenv("SYSTEM_TRADE_ACCOUNT_ALIAS", "hagfish")
+
+    settings = Settings.load("")
+
+    assert settings.account_alias == "hagfish"

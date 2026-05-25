@@ -31,8 +31,13 @@
 - `side`, `symbol`, `order_type`, `quantity`, `price`
 - `status` (`CREATED` ~ `FAILED`)
 - `strategy_id` (기존 `algo` 번호 호환)
+- `strategy_family` (알고리즘별 계좌 매핑 기준: `test`, `hagfish`, `halfrise` 등)
 - `strategy_name`
+- `strategy_version`
+- `signal_id`, `condition_id`, `condition_version`
+- `condition_snapshot`, `intent_metadata`
 - `trade_date`, `reason`
+- `account_alias`, `account_no`
 - `broker_order_no`, `broker_org_order_no`
 
 ### `trade_order_events`
@@ -43,11 +48,23 @@
 체결 레코드 단위 저장.
 - 체결 수량/가격/수수료/세금/체결시각.
 
-### `trade_positions`
-계좌-종목 포지션 스냅샷/집계.
+### `account_query_requests` 계열
+KIS 잔고/가능수량/정정취소가능/일별체결 조회 요청과 응답 스냅샷.
+- 원본 응답은 JSON으로 저장.
+- 잔고 요약, 보유 종목, 매수/매도 가능수량, 정정취소 가능 주문, 일별체결 row는 별도 snapshot table에 best-effort 정규화.
 
-### `trade_account_balances`
-현금/평가금액 스냅샷.
+### `trade_accounts`, `strategy_account_allocations`
+알고리즘별 계좌 분리를 위한 계좌 마스터와 전략-계좌 매핑.
+- 초기 운영 가정: `test`, `hagfish`, `halfrise` 계좌 3개.
+- `test`: 오래된 테스트 계좌. hagfish 2.6 검증 기간에는 `strategy_family='hagfish'` 주문도 이 계좌에 매핑한다.
+- `hagfish`: 이번에 만든 hagfish 알고리즘 전용 계좌. 검증 후 동일한 hagfish 주문 의도를 이 alias로 전환한다.
+- `halfrise`: 다음 주에 만들 halfrise 알고리즘 전용 예정 계좌. 개설 전에는 `account_status='PLANNED'`, `is_active=0`으로 둔다.
+- 운영 버전명은 바뀔 수 있으므로 계좌 매핑은 `strategy_name`이 아니라 `strategy_family`를 우선한다.
+
+### `account_capital_allocations`
+계좌별 목표 자금 배분 계획.
+- 실제 잔고와 보유 종목은 KIS 조회 snapshot으로 남긴다.
+- 이 테이블은 `test`, `hagfish`, `halfrise`에 각각 얼마 또는 몇 %를 배정하기로 했는지 운용 기준값을 남긴다.
 
 ## 3) 컬럼 매핑
 
@@ -77,7 +94,7 @@
 - 의도/상태: `trade_orders`
 - 이벤트로그: `trade_order_events`
 - 체결: `trade_fills`
-- 포지션/잔고: `trade_positions`, `trade_account_balances`
+- 잔고/가능수량/조회 스냅샷: `account_query_requests` 계열
 
 운영 관점에서 장애 원인 추적, 재처리, 정합성 검증이 훨씬 쉬워짐.
 
