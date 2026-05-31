@@ -20,6 +20,11 @@
 - 뉴스 크롤링/배치 ETL (`systemData`로 분리)
 - 백테스팅/전략 시뮬레이션
 
+## 로컬 산출물 저장
+
+거래 원장과 계좌 스냅샷은 MySQL을 기준 저장소로 둔다. 파일 로그, export, reconciliation 결과를 남겨야 할 때는 `/Volumes/InvestmentStore/aquma-finance/systemTrade/` 아래 `logs/`, `exports/`, `reconciliation/`을 사용한다.
+KIS 토큰 캐시는 민감 정보이고 SSD 미마운트 시 실거래 인증이 깨질 수 있어 기본 홈 디렉터리 캐시를 유지한다.
+
 ## 환경 설정 (`pyenv` + `Poetry`)
 
 ```bash
