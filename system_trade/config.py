@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from dotenv import find_dotenv, load_dotenv
 
 from .exceptions import ConfigError
+
+DEFAULT_ACCOUNT_ALIASES = ("test", "hagfish", "halfrise")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -29,6 +32,13 @@ def _infer_kis_paper(explicit_value: str | None, base_url: str | None) -> bool:
 
 
 @dataclass(frozen=True)
+class AccountBinding:
+    account_alias: str
+    account_no: str
+    account_product_code: str
+
+
+@dataclass(frozen=True)
 class Settings:
     kis_app_key: str
     kis_app_secret: str
@@ -43,6 +53,7 @@ class Settings:
     db_password: str
     db_name: str
     account_alias: str | None = None
+    account_bindings: dict[str, AccountBinding] = field(default_factory=dict)
 
     @classmethod
     def load(cls, explicit_env_file: str | None = None, require_kis: bool = True) -> "Settings":
@@ -82,7 +93,12 @@ class Settings:
         db_user = os.getenv("SYSTEM_TRADE_DB_USER", "root").strip()
         db_password = os.getenv("SYSTEM_TRADE_DB_PASSWORD", "")
         db_name = os.getenv("SYSTEM_TRADE_DB_NAME", "trade").strip()
-        account_alias = (os.getenv("SYSTEM_TRADE_ACCOUNT_ALIAS") or os.getenv("KIS_ACCOUNT_ALIAS") or "").strip() or None
+        account_alias = _normalize_account_alias(os.getenv("SYSTEM_TRADE_ACCOUNT_ALIAS") or os.getenv("KIS_ACCOUNT_ALIAS"))
+        account_bindings = _load_account_bindings(account_alias)
+        if account_alias and account_alias in account_bindings:
+            account_binding = account_bindings[account_alias]
+            kis_account_no = account_binding.account_no
+            kis_acnt_prdt = account_binding.account_product_code
 
         if require_kis and (not kis_app_key or not kis_app_secret):
             raise ConfigError("KIS_APP_KEY and KIS_APP_SECRET are required.")
@@ -100,11 +116,48 @@ class Settings:
             db_password=db_password,
             db_name=db_name,
             account_alias=account_alias,
+            account_bindings=account_bindings,
         )
 
     def require_account(self) -> None:
         if not self.kis_account_no or not self.kis_acnt_prdt:
             raise ConfigError("KIS_ACCOUNT_NO and KIS_ACNT_PRDT are required for order submission.")
+
+    def for_account_alias(self, account_alias: str | None) -> "Settings":
+        requested_alias = _normalize_account_alias(account_alias)
+        if requested_alias and self.account_alias and requested_alias != self.account_alias:
+            raise ConfigError(
+                f"account_alias mismatch: request={requested_alias}, env={self.account_alias}"
+            )
+
+        selected_alias = requested_alias or self.account_alias
+        if not selected_alias:
+            return self
+
+        binding = self.account_bindings.get(selected_alias)
+        if binding:
+            return replace(
+                self,
+                kis_account_no=binding.account_no,
+                kis_acnt_prdt=binding.account_product_code,
+                account_alias=selected_alias,
+            )
+
+        return replace(self, account_alias=selected_alias)
+
+    def with_account(
+        self,
+        *,
+        account_alias: str | None,
+        account_no: str,
+        account_product_code: str,
+    ) -> "Settings":
+        return replace(
+            self,
+            account_alias=_normalize_account_alias(account_alias),
+            kis_account_no=account_no,
+            kis_acnt_prdt=account_product_code,
+        )
 
     def migration_path(self) -> Path:
         return Path(__file__).resolve().parent.parent / "migrations" / "001_init.sql"
@@ -157,5 +210,84 @@ def _parse_account_fields(
             first = left.strip()
         if not second:
             second = right.strip()
+    elif combined and not first:
+        first = combined
 
     return first or None, second or None
+
+
+def _normalize_account_alias(account_alias: str | None) -> str | None:
+    normalized = (account_alias or "").strip().lower()
+    return normalized or None
+
+
+def _env_suffix(account_alias: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", account_alias.upper()).strip("_")
+
+
+def _first_env(*names: str) -> str | None:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value.strip():
+            return value.strip()
+    return None
+
+
+def _known_account_aliases(account_alias: str | None) -> set[str]:
+    aliases = set(DEFAULT_ACCOUNT_ALIASES)
+    if account_alias:
+        aliases.add(account_alias)
+
+    split_prefixes = (
+        "SYSTEM_TRADE_ACCOUNT_NO_",
+        "SYSTEM_TRADE_ACNT_PRDT_",
+        "SYSTEM_TRADE_ACCOUNT_CODE_",
+        "KIS_ACCOUNT_NO_",
+        "KIS_ACCOUNT_NUMBER_",
+        "KIS_ACNT_PRDT_",
+        "KIS_ACCOUNT_CODE_",
+    )
+    full_prefixes = ("SYSTEM_TRADE_ACCOUNT_", "KIS_ACCOUNT_")
+    reserved_full_suffixes = {"ALIAS", "FULL", "NO", "NUMBER", "CODE"}
+
+    for name in os.environ:
+        split_suffix = next((name[len(prefix):] for prefix in split_prefixes if name.startswith(prefix)), None)
+        if split_suffix:
+            aliases.add(split_suffix.lower())
+            continue
+
+        full_suffix = next((name[len(prefix):] for prefix in full_prefixes if name.startswith(prefix)), None)
+        if full_suffix and full_suffix not in reserved_full_suffixes:
+            aliases.add(full_suffix.lower())
+
+    return aliases
+
+
+def _load_account_bindings(account_alias: str | None) -> dict[str, AccountBinding]:
+    bindings: dict[str, AccountBinding] = {}
+    for alias in sorted(_known_account_aliases(account_alias)):
+        suffix = _env_suffix(alias)
+        if not suffix:
+            continue
+
+        account_no, account_product_code = _parse_account_fields(
+            _first_env(f"SYSTEM_TRADE_ACCOUNT_NO_{suffix}", f"KIS_ACCOUNT_NO_{suffix}"),
+            _first_env(f"KIS_ACCOUNT_NUMBER_{suffix}"),
+            _first_env(f"SYSTEM_TRADE_ACCOUNT_{suffix}", f"KIS_ACCOUNT_{suffix}"),
+            None,
+            _first_env(
+                f"SYSTEM_TRADE_ACNT_PRDT_{suffix}",
+                f"SYSTEM_TRADE_ACCOUNT_CODE_{suffix}",
+                f"KIS_ACNT_PRDT_{suffix}",
+                f"KIS_ACCOUNT_CODE_{suffix}",
+            ),
+            None,
+        )
+        if account_no and account_product_code:
+            bindings[alias] = AccountBinding(
+                account_alias=alias,
+                account_no=account_no,
+                account_product_code=account_product_code,
+            )
+
+    return bindings

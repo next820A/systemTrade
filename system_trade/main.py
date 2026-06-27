@@ -26,18 +26,45 @@ def _utcnow_naive() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-def _new_stack() -> tuple[Settings, KISClient, MySQLRepository, OrderService]:
-    settings = Settings.load()
-    kis_client = KISClient(settings)
+def _resolve_runtime_account(settings: Settings, repository: MySQLRepository) -> Settings:
+    if not settings.account_alias:
+        return settings
+
+    trade_account = repository.find_active_trade_account_by_alias(
+        account_alias=settings.account_alias,
+    )
+    if not trade_account:
+        raise ConfigError(
+            "No active DB trade_accounts row has a bound account for "
+            f"account_alias={settings.account_alias}. "
+            "Run bind-account first, or use legacy KIS_ACCOUNT_* without an alias."
+        )
+
+    return settings.with_account(
+        account_alias=str(trade_account["account_alias"]),
+        account_no=str(trade_account["account_no"]),
+        account_product_code=str(trade_account["account_product_code"]),
+    )
+
+
+def _new_stack(account_alias: str | None = None) -> tuple[Settings, KISClient, MySQLRepository, OrderService]:
+    settings = Settings.load().for_account_alias(account_alias)
     repository = MySQLRepository(settings)
+    settings = _resolve_runtime_account(settings, repository)
+    kis_client = KISClient(settings)
     service = OrderService(repository=repository, kis_client=kis_client)
     return settings, kis_client, repository, service
 
 
-def _new_order_stack(*, require_kis: bool = True) -> tuple[Settings, KISClient, MySQLRepository, OrderService]:
-    settings = Settings.load(require_kis=require_kis)
-    kis_client = KISClient(settings)
+def _new_order_stack(
+    *,
+    account_alias: str | None = None,
+    require_kis: bool = True,
+) -> tuple[Settings, KISClient, MySQLRepository, OrderService]:
+    settings = Settings.load(require_kis=require_kis).for_account_alias(account_alias)
     repository = MySQLRepository(settings)
+    settings = _resolve_runtime_account(settings, repository)
+    kis_client = KISClient(settings)
     service = OrderService(repository=repository, kis_client=kis_client)
     return settings, kis_client, repository, service
 
@@ -49,7 +76,8 @@ def _new_repository() -> tuple[Settings, MySQLRepository]:
 
 
 def cmd_health_check(args: argparse.Namespace) -> int:
-    _, kis_client, _, _ = _new_stack()
+    settings = Settings.load()
+    kis_client = KISClient(settings)
     token = kis_client.get_access_token()
     price = kis_client.get_current_price(args.symbol)
     output = price.get("output", {})
@@ -83,17 +111,92 @@ def _mask_account_no(account_no: str | None) -> str | None:
     return "***" + account_no[-4:]
 
 
+def _account_fields_from_args(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    account_no = (args.account_no or "").strip() or None
+    account_product_code = (args.account_product_code or "").strip() or None
+    account_full = (args.account_full or "").strip()
+
+    if account_full:
+        if "-" in account_full:
+            left, right = account_full.split("-", 1)
+            account_no = account_no or left.strip()
+            account_product_code = account_product_code or right.strip()
+        else:
+            account_no = account_no or account_full
+
+    return account_no, account_product_code
+
+
 def cmd_bind_account(args: argparse.Namespace) -> int:
     settings, repository = _new_repository()
+    account_no, account_product_code = _account_fields_from_args(args)
+    if account_no or account_product_code:
+        if not account_no or not account_product_code:
+            raise ConfigError("--account-full or both --account-no and --account-product-code are required.")
+        settings = settings.with_account(
+            account_alias=args.account_alias,
+            account_no=account_no,
+            account_product_code=account_product_code,
+        )
+    else:
+        settings = settings.for_account_alias(args.account_alias)
     settings.require_account()
+    account_alias = settings.account_alias or args.account_alias
     repository.ensure_database()
     row = repository.bind_trade_account_alias(
-        account_alias=args.account_alias,
+        account_alias=str(account_alias),
         account_no=str(settings.kis_account_no),
         account_product_code=str(settings.kis_acnt_prdt),
     )
     output = dict(row)
     output["account_no"] = _mask_account_no(output.get("account_no"))
+    print(json.dumps(output, ensure_ascii=False, default=str, indent=2))
+    return 0
+
+
+def cmd_accounts(args: argparse.Namespace) -> int:
+    settings = Settings.load(require_kis=False).for_account_alias(args.account_alias)
+    repository = MySQLRepository(settings)
+    db_accounts = []
+    for row in repository.list_trade_accounts():
+        output_row = dict(row)
+        output_row["account_no"] = _mask_account_no(output_row.get("account_no"))
+        db_accounts.append(output_row)
+
+    env_accounts = [
+        {
+            "account_alias": alias,
+            "account_no": _mask_account_no(binding.account_no),
+            "account_product_code": binding.account_product_code,
+        }
+        for alias, binding in sorted(settings.account_bindings.items())
+    ]
+    if not env_accounts and settings.kis_account_no:
+        env_accounts.append(
+            {
+                "account_alias": settings.account_alias or "default",
+                "account_no": _mask_account_no(settings.kis_account_no),
+                "account_product_code": settings.kis_acnt_prdt,
+            }
+        )
+
+    selected_account = None
+    if settings.account_alias:
+        selected_account = repository.find_active_trade_account_by_alias(
+            account_alias=settings.account_alias,
+        )
+
+    output = {
+        "selected_account_alias": settings.account_alias,
+        "selected_account_no": _mask_account_no(
+            str(selected_account["account_no"]) if selected_account else settings.kis_account_no
+        ),
+        "selected_account_product_code": (
+            str(selected_account["account_product_code"]) if selected_account else settings.kis_acnt_prdt
+        ),
+        "db_accounts": db_accounts,
+        "env_accounts": env_accounts,
+    }
     print(json.dumps(output, ensure_ascii=False, default=str, indent=2))
     return 0
 
@@ -167,7 +270,7 @@ def _save_query_request(
 
 
 def cmd_balance(args: argparse.Namespace) -> int:
-    settings, kis_client, repository, _ = _new_stack()
+    settings, kis_client, repository, _ = _new_stack(account_alias=args.account_alias)
     requested_at = _utcnow_naive()
     payload = kis_client.get_stock_balance()
     responded_at = _utcnow_naive()
@@ -180,7 +283,7 @@ def cmd_balance(args: argparse.Namespace) -> int:
             response_payload=payload,
             requested_at=requested_at,
             responded_at=responded_at,
-            account_alias=args.account_alias,
+            account_alias=settings.account_alias,
         )
         summary = balance_summary_from_response(payload)
         repository.insert_account_balance_summary(
@@ -207,7 +310,7 @@ def cmd_balance(args: argparse.Namespace) -> int:
 
 
 def cmd_daily_ccld(args: argparse.Namespace) -> int:
-    settings, kis_client, repository, _ = _new_stack()
+    settings, kis_client, repository, _ = _new_stack(account_alias=args.account_alias)
     requested_at = _utcnow_naive()
     payload = kis_client.get_daily_ccld(
         start_date=args.start_date,
@@ -240,7 +343,7 @@ def cmd_daily_ccld(args: argparse.Namespace) -> int:
             requested_at=requested_at,
             responded_at=responded_at,
             symbol=args.symbol or None,
-            account_alias=args.account_alias,
+            account_alias=settings.account_alias,
             start_date=_parse_yyyymmdd(args.start_date),
             end_date=_parse_yyyymmdd(args.end_date),
         )
@@ -259,7 +362,7 @@ def cmd_daily_ccld(args: argparse.Namespace) -> int:
 
 
 def cmd_buying_power(args: argparse.Namespace) -> int:
-    settings, kis_client, repository, _ = _new_stack()
+    settings, kis_client, repository, _ = _new_stack(account_alias=args.account_alias)
     requested_at = _utcnow_naive()
     payload = kis_client.get_buying_power(
         symbol=args.symbol,
@@ -282,7 +385,7 @@ def cmd_buying_power(args: argparse.Namespace) -> int:
             requested_at=requested_at,
             responded_at=responded_at,
             symbol=args.symbol,
-            account_alias=args.account_alias,
+            account_alias=settings.account_alias,
             order_type=_parse_order_type(args.order_type).value,
             price=args.price,
         )
@@ -305,7 +408,7 @@ def cmd_buying_power(args: argparse.Namespace) -> int:
 
 
 def cmd_sellable(args: argparse.Namespace) -> int:
-    settings, kis_client, repository, _ = _new_stack()
+    settings, kis_client, repository, _ = _new_stack(account_alias=args.account_alias)
     requested_at = _utcnow_naive()
     payload = kis_client.get_sellable_quantity(symbol=args.symbol)
     responded_at = _utcnow_naive()
@@ -319,7 +422,7 @@ def cmd_sellable(args: argparse.Namespace) -> int:
             requested_at=requested_at,
             responded_at=responded_at,
             symbol=args.symbol,
-            account_alias=args.account_alias,
+            account_alias=settings.account_alias,
         )
         capacity = sellable_from_response(payload)
         repository.insert_order_capacity_snapshot(
@@ -338,7 +441,7 @@ def cmd_sellable(args: argparse.Namespace) -> int:
 
 
 def cmd_cancelable_orders(args: argparse.Namespace) -> int:
-    settings, kis_client, repository, _ = _new_stack()
+    settings, kis_client, repository, _ = _new_stack(account_alias=args.account_alias)
     requested_at = _utcnow_naive()
     payload = kis_client.get_cancelable_orders(
         query_by=args.query_by,
@@ -358,7 +461,7 @@ def cmd_cancelable_orders(args: argparse.Namespace) -> int:
             response_payload=payload,
             requested_at=requested_at,
             responded_at=responded_at,
-            account_alias=args.account_alias,
+            account_alias=settings.account_alias,
         )
         rows = [
             {
@@ -387,7 +490,10 @@ def cmd_tr_ids(args: argparse.Namespace) -> int:
 
 
 def cmd_order(args: argparse.Namespace) -> int:
-    settings, _, repository, service = _new_order_stack(require_kis=not args.record_only)
+    settings, _, repository, service = _new_order_stack(
+        account_alias=args.account_alias,
+        require_kis=not args.record_only,
+    )
     settings.require_account()
     if not args.record_only and not settings.kis_paper and not args.allow_live:
         raise ConfigError("Live order is blocked by default. Re-run with --allow-live if intended.")
@@ -406,7 +512,7 @@ def cmd_order(args: argparse.Namespace) -> int:
         strategy_name=args.strategy,
         strategy_version=args.strategy_version,
         reason=args.reason,
-        account_alias=args.account_alias,
+        account_alias=settings.account_alias,
         source_system=args.source_system,
         source_run_id=args.source_run_id,
         source_symbol=args.source_symbol,
@@ -443,9 +549,16 @@ def build_parser() -> argparse.ArgumentParser:
     init_db = sub.add_parser("init-db", help="apply mysql migration")
     init_db.set_defaults(func=cmd_init_db)
 
-    bind_account = sub.add_parser("bind-account", help="bind current KIS account env to a trade account alias")
+    bind_account = sub.add_parser("bind-account", help="bind a KIS account to a trade account alias")
     bind_account.add_argument("--account-alias", required=True)
+    bind_account.add_argument("--account-full", help="KIS account in 12345678-01 format")
+    bind_account.add_argument("--account-no", help="KIS account first 8 digits")
+    bind_account.add_argument("--account-product-code", help="KIS account product code, e.g. 01")
     bind_account.set_defaults(func=cmd_bind_account)
+
+    accounts = sub.add_parser("accounts", help="show configured KIS account aliases")
+    accounts.add_argument("--account-alias")
+    accounts.set_defaults(func=cmd_accounts)
 
     balance = sub.add_parser("balance", help="query account balance and holdings")
     balance.add_argument("--account-alias")

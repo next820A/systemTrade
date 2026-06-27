@@ -125,6 +125,54 @@ class MySQLRepository:
                 cursor.execute(sql, (broker, account_alias, account_no, account_product_code))
                 return cursor.fetchone()
 
+    def find_active_trade_account_by_alias(
+        self,
+        *,
+        account_alias: str,
+        broker: str = "KIS",
+    ) -> dict[str, Any] | None:
+        sql = """
+        SELECT *
+        FROM trade_accounts
+        WHERE broker = %s
+          AND account_alias = %s
+          AND account_no IS NOT NULL
+          AND account_product_code IS NOT NULL
+          AND account_status = 'ACTIVE'
+          AND is_active = 1
+        LIMIT 1
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (broker, account_alias))
+                return cursor.fetchone()
+
+    def list_trade_accounts(self, *, broker: str = "KIS") -> list[dict[str, Any]]:
+        sql = """
+        SELECT
+            id,
+            broker,
+            account_alias,
+            account_no,
+            account_product_code,
+            account_role,
+            account_status,
+            is_active,
+            purpose
+        FROM trade_accounts
+        WHERE broker = %s
+        ORDER BY CASE account_alias
+            WHEN 'test' THEN 1
+            WHEN 'hagfish' THEN 2
+            WHEN 'halfrise' THEN 3
+            ELSE 99
+        END, account_alias
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (broker,))
+                return list(cursor.fetchall())
+
     def bind_trade_account_alias(
         self,
         *,
@@ -150,20 +198,33 @@ class MySQLRepository:
                 if cursor.rowcount == 0:
                     cursor.execute(
                         """
-                        INSERT INTO trade_accounts (
-                            broker,
-                            account_alias,
-                            account_no,
-                            account_product_code,
-                            account_role,
-                            account_status,
-                            purpose,
-                            is_active
-                        )
-                        VALUES (%s, %s, %s, %s, 'STRATEGY', 'ACTIVE', NULL, 1)
+                        SELECT id
+                        FROM trade_accounts
+                        WHERE broker = %s
+                          AND account_alias = %s
+                        LIMIT 1
                         """,
-                        (broker, account_alias, account_no, account_product_code),
+                        (broker, account_alias),
                     )
+                    if cursor.fetchone():
+                        pass
+                    else:
+                        cursor.execute(
+                            """
+                            INSERT INTO trade_accounts (
+                                broker,
+                                account_alias,
+                                account_no,
+                                account_product_code,
+                                account_role,
+                                account_status,
+                                purpose,
+                                is_active
+                            )
+                            VALUES (%s, %s, %s, %s, 'STRATEGY', 'ACTIVE', NULL, 1)
+                            """,
+                            (broker, account_alias, account_no, account_product_code),
+                        )
                 conn.commit()
 
         row = self.find_active_trade_account(

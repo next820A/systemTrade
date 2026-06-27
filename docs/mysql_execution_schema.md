@@ -57,8 +57,8 @@ MySQL에 남기지 않는 것:
 - `account_query_requests`: 잔고/가능수량 조회도 어떤 알고리즘 계좌를 조회했는지 `account_alias`를 함께 저장
 
 운영 이름은 버전마다 바뀔 수 있으므로 계좌 매핑은 `strategy_name`보다 `strategy_family`를 우선한다.
-계좌별 실행 환경에는 `SYSTEM_TRADE_ACCOUNT_ALIAS`를 지정하고, 주문 요청의 `account_alias`와 env alias가 다르면 주문을 차단한다.
-실주문 전에는 해당 alias의 `trade_accounts` 행이 KIS 계좌번호와 일치하고 `ACTIVE/is_active=1`이어야 하며,
+계좌별 실행은 명령의 `account_alias`를 기준으로 `trade_accounts`에서 KIS 계좌번호를 읽는다. `SYSTEM_TRADE_ACCOUNT_ALIAS`는 선택적 기본값으로만 사용하고, 명령의 `account_alias`와 env alias가 다르면 주문을 차단한다.
+실주문 전에는 해당 alias의 `trade_accounts` 행에 KIS 계좌번호가 바인딩되어 있고 `ACTIVE/is_active=1`이어야 하며,
 전략 계좌는 같은 `trade_account_id`에 active `strategy_account_allocations` 매핑이 있어야 한다.
 
 기본 매핑은 아래처럼 둔다.

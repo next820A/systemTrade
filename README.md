@@ -35,7 +35,15 @@ poetry install --with dev
 ```
 
 필요하면 `.env.example`를 참고하면 됩니다. 코드가 상위 디렉터리의 `.env`도 자동으로 탐색합니다.
-계좌를 알고리즘별로 나눠 실행할 때는 계좌별 실행 환경에 `SYSTEM_TRADE_ACCOUNT_ALIAS=test`, `SYSTEM_TRADE_ACCOUNT_ALIAS=hagfish`, `SYSTEM_TRADE_ACCOUNT_ALIAS=halfrise` 중 하나를 함께 둡니다.
+계좌를 알고리즘별로 나눠 실행할 때는 MySQL의 `trade_accounts`를 기준으로 둡니다. `.env`에는 KIS 앱키/시크릿과 DB 접속 정보만 두는 것을 기본으로 하고, 계좌번호는 아래 `bind-account`로 DB에 바인딩합니다.
+
+```bash
+poetry run python -m system_trade.main bind-account --account-alias test --account-full 12345678-01
+poetry run python -m system_trade.main bind-account --account-alias hagfish --account-full 23456789-01
+poetry run python -m system_trade.main bind-account --account-alias halfrise --account-full 34567890-01
+```
+
+실행할 때는 명령마다 `--account-alias hagfish`처럼 선택합니다. 계좌번호를 `.env`에 둘 수도 있지만 이는 초기 바인딩/비상용입니다. 기존 단일 계좌 환경변수인 `KIS_ACCOUNT_NO`, `KIS_ACNT_PRDT`, `KIS_ACCOUNT_FULL`도 계속 지원합니다.
 
 ## 주요 명령어
 
@@ -46,17 +54,20 @@ poetry run python -m system_trade.main health-check --symbol 005930
 # 현재 선택된 고정 TR ID 세트 확인
 poetry run python -m system_trade.main tr-ids
 
+# DB와 로컬 환경에 잡힌 alias별 계좌 확인 (번호는 마스킹됨)
+poetry run python -m system_trade.main accounts
+
 # 보유 종목과 계좌 요약 조회
-poetry run python -m system_trade.main balance
+poetry run python -m system_trade.main balance --account-alias hagfish
 
 # 일자별 주문/체결 이력 조회
-poetry run python -m system_trade.main daily-ccld --start-date 20260301 --end-date 20260307
+poetry run python -m system_trade.main daily-ccld --account-alias hagfish --start-date 20260301 --end-date 20260307
 
 # 특정 종목/가격 기준 매수 가능 수량 조회
-poetry run python -m system_trade.main buying-power --symbol 005930 --price 70000 --order-type LIMIT
+poetry run python -m system_trade.main buying-power --account-alias hagfish --symbol 005930 --price 70000 --order-type LIMIT
 
 # 매도 가능 수량 조회
-poetry run python -m system_trade.main sellable --symbol 005930
+poetry run python -m system_trade.main sellable --account-alias hagfish --symbol 005930
 
 # MySQL 마이그레이션 적용
 poetry run python -m system_trade.main init-db
@@ -82,8 +93,10 @@ poetry run python -m system_trade.main list-orders --limit 20
 | `hagfish` | hagfish 알고리즘 전용 계좌 | 즉시 사용 |
 | `halfrise` | halfrise_v2 legacy-close 알고리즘 전용 계좌 | 계좌번호 바인딩 후 사용 |
 
-계좌번호는 저장소에 커밋하지 않고 DB나 실행 환경에만 둡니다. 현재 실행 환경의 KIS 계좌를 alias에 묶을 때는 `poetry run python -m system_trade.main bind-account --account-alias test`처럼 등록합니다. `halfrise` 계좌를 만든 뒤에는 같은 방식으로 alias를 묶으면 `halfrise_v2`/`2.0` 전략 매핑으로 주문 의도 기록이 가능합니다. 목표 자금 배분은 `account_capital_allocations`에 계좌별 금액 또는 비중으로 기록합니다.
-테스트 기간에는 `SYSTEM_TRADE_ACCOUNT_ALIAS=test` 환경에서 `--account-alias test --strategy-family hagfish --strategy-version 2.6` 주문만 허용하고, 승격 후에는 환경과 주문 인자를 둘 다 `hagfish` alias로 바꿉니다.
+계좌번호는 저장소에 커밋하지 않고 DB에만 둡니다. `bind-account`는 `trade_accounts.account_alias`에 KIS 계좌번호와 상품코드를 묶고 `ACTIVE`로 전환합니다. 목표 자금 배분은 `account_capital_allocations`에 계좌별 금액 또는 비중으로 기록합니다.
+테스트 기간에는 `--account-alias test --strategy-family hagfish --strategy-version 2.6` 주문만 허용하고, 승격 후에는 주문 인자를 `--account-alias hagfish`로 바꿉니다.
+
+한투 일반 주문/계좌 조회 API는 주문/잔고 요청에 계좌번호(`CANO`)와 상품코드(`ACNT_PRDT_CD`)를 넘기는 방식이라, 이 저장소에서는 API로 계좌 목록을 자동 수집하지 않습니다. 계좌번호를 확인한 뒤 DB의 `trade_accounts` 바인딩으로 관리합니다. `.env`의 alias별 값은 초기 바인딩/비상용으로만 둡니다.
 
 ## 백테스팅과의 경계
 
