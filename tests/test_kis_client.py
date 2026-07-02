@@ -43,3 +43,28 @@ def test_kis_client_uses_fixed_real_tr_ids() -> None:
     assert client.tr_ids.order_sell == "TTTC0011U"
     assert client.tr_ids.order_rvsecncl == "TTTC0013U"
     assert client.tr_ids.balance == "TTTC8434R"
+
+
+def test_kis_client_token_cache_is_scoped_to_app_key() -> None:
+    from dataclasses import replace
+
+    from system_trade.kis_client import KISClient
+
+    settings = Settings(
+        kis_app_key="key-a",
+        kis_app_secret="secret",
+        kis_paper=False,
+        kis_base_url="https://openapi.koreainvestment.com:9443",
+        kis_account_no="63611886",
+        kis_acnt_prdt="01",
+        db_host="127.0.0.1",
+        db_port=3306,
+        db_user="root",
+        db_password="",
+        db_name="trade",
+    )
+
+    first = KISClient(settings)
+    second = KISClient(replace(settings, kis_app_key="key-b"))
+
+    assert first._token_cache_file != second._token_cache_file

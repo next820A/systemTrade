@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import threading
 import time
 from pathlib import Path
@@ -43,7 +44,7 @@ class KISClient:
         self._token: str | None = None
         self._token_expire_ts: float = 0
         self._lock = threading.Lock()
-        self._token_cache_file = Path.home() / ".kis_token_cache_systemtrade.json"
+        self._token_cache_file = Path.home() / f".kis_token_cache_systemtrade_{self._token_cache_key()}.json"
         self._load_cached_token()
 
     def _load_cached_token(self) -> None:
@@ -68,6 +69,16 @@ class KISClient:
             self._token_cache_file.write_text(json.dumps(payload), encoding="utf-8")
         except Exception:
             return
+
+    def _token_cache_key(self) -> str:
+        raw = "|".join(
+            [
+                self._settings.kis_base_url,
+                self._settings.kis_app_key,
+                "paper" if self._settings.kis_paper else "real",
+            ]
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
     def _issue_token(self) -> str:
         url = f"{self._settings.kis_base_url}/oauth2/tokenP"

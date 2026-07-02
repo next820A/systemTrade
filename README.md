@@ -45,6 +45,17 @@ poetry run python -m system_trade.main bind-account --account-alias halfrise --a
 
 실행할 때는 명령마다 `--account-alias hagfish`처럼 선택합니다. 계좌번호를 `.env`에 둘 수도 있지만 이는 초기 바인딩/비상용입니다. 기존 단일 계좌 환경변수인 `KIS_ACCOUNT_NO`, `KIS_ACNT_PRDT`, `KIS_ACCOUNT_FULL`도 계속 지원합니다.
 
+KIS app key/secret이 계좌별로 발급되어 있으면 `.env`에 alias별 credential을 둡니다. 주문/조회 실행 시 `--account-alias`에 맞는 credential이 전역 `KIS_APP_KEY`보다 우선됩니다.
+
+```bash
+SYSTEM_TRADE_APP_KEY_TEST=
+SYSTEM_TRADE_APP_SECRET_TEST=
+SYSTEM_TRADE_APP_KEY_HAGFISH=
+SYSTEM_TRADE_APP_SECRET_HAGFISH=
+SYSTEM_TRADE_APP_KEY_HALFRISE=
+SYSTEM_TRADE_APP_SECRET_HALFRISE=
+```
+
 ## 주요 명령어
 
 ```bash

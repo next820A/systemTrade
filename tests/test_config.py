@@ -80,6 +80,20 @@ def test_settings_can_select_requested_alias_account(monkeypatch) -> None:
     assert settings.kis_acnt_prdt == "01"
 
 
+def test_settings_can_select_requested_alias_credentials(monkeypatch) -> None:
+    monkeypatch.setenv("KIS_APP_KEY", "global-key")
+    monkeypatch.setenv("KIS_APP_SECRET", "global-secret")
+    monkeypatch.setenv("SYSTEM_TRADE_APP_KEY_HAGFISH", "hagfish-key")
+    monkeypatch.setenv("SYSTEM_TRADE_APP_SECRET_HAGFISH", "hagfish-secret")
+    monkeypatch.delenv("SYSTEM_TRADE_ACCOUNT_ALIAS", raising=False)
+
+    settings = Settings.load("").for_account_alias("hagfish")
+
+    assert settings.account_alias == "hagfish"
+    assert settings.kis_app_key == "hagfish-key"
+    assert settings.kis_app_secret == "hagfish-secret"
+
+
 def test_settings_blocks_requested_alias_mismatch(monkeypatch) -> None:
     monkeypatch.setenv("KIS_APP_KEY", "key")
     monkeypatch.setenv("KIS_APP_SECRET", "secret")

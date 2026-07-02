@@ -39,6 +39,13 @@ class AccountBinding:
 
 
 @dataclass(frozen=True)
+class CredentialBinding:
+    account_alias: str
+    kis_app_key: str
+    kis_app_secret: str
+
+
+@dataclass(frozen=True)
 class Settings:
     kis_app_key: str
     kis_app_secret: str
@@ -54,6 +61,7 @@ class Settings:
     db_name: str
     account_alias: str | None = None
     account_bindings: dict[str, AccountBinding] = field(default_factory=dict)
+    credential_bindings: dict[str, CredentialBinding] = field(default_factory=dict)
 
     @classmethod
     def load(cls, explicit_env_file: str | None = None, require_kis: bool = True) -> "Settings":
@@ -95,10 +103,15 @@ class Settings:
         db_name = os.getenv("SYSTEM_TRADE_DB_NAME", "trade").strip()
         account_alias = _normalize_account_alias(os.getenv("SYSTEM_TRADE_ACCOUNT_ALIAS") or os.getenv("KIS_ACCOUNT_ALIAS"))
         account_bindings = _load_account_bindings(account_alias)
+        credential_bindings = _load_credential_bindings(account_alias)
         if account_alias and account_alias in account_bindings:
             account_binding = account_bindings[account_alias]
             kis_account_no = account_binding.account_no
             kis_acnt_prdt = account_binding.account_product_code
+        if account_alias and account_alias in credential_bindings:
+            credential_binding = credential_bindings[account_alias]
+            kis_app_key = credential_binding.kis_app_key
+            kis_app_secret = credential_binding.kis_app_secret
 
         if require_kis and (not kis_app_key or not kis_app_secret):
             raise ConfigError("KIS_APP_KEY and KIS_APP_SECRET are required.")
@@ -117,6 +130,7 @@ class Settings:
             db_name=db_name,
             account_alias=account_alias,
             account_bindings=account_bindings,
+            credential_bindings=credential_bindings,
         )
 
     def require_account(self) -> None:
@@ -135,15 +149,16 @@ class Settings:
             return self
 
         binding = self.account_bindings.get(selected_alias)
+        credential = self.credential_bindings.get(selected_alias)
+        updates: dict[str, str | None] = {"account_alias": selected_alias}
         if binding:
-            return replace(
-                self,
-                kis_account_no=binding.account_no,
-                kis_acnt_prdt=binding.account_product_code,
-                account_alias=selected_alias,
-            )
+            updates["kis_account_no"] = binding.account_no
+            updates["kis_acnt_prdt"] = binding.account_product_code
+        if credential:
+            updates["kis_app_key"] = credential.kis_app_key
+            updates["kis_app_secret"] = credential.kis_app_secret
 
-        return replace(self, account_alias=selected_alias)
+        return replace(self, **updates)
 
     def with_account(
         self,
@@ -242,13 +257,27 @@ def _known_account_aliases(account_alias: str | None) -> set[str]:
         "SYSTEM_TRADE_ACCOUNT_NO_",
         "SYSTEM_TRADE_ACNT_PRDT_",
         "SYSTEM_TRADE_ACCOUNT_CODE_",
+        "SYSTEM_TRADE_APP_KEY_",
+        "SYSTEM_TRADE_APP_SECRET_",
+        "SYSTEM_TRADE_ACCOUNT_APP_KEY_",
+        "SYSTEM_TRADE_ACCOUNT_APP_SECRET_",
         "KIS_ACCOUNT_NO_",
         "KIS_ACCOUNT_NUMBER_",
         "KIS_ACNT_PRDT_",
         "KIS_ACCOUNT_CODE_",
+        "KIS_APP_KEY_",
+        "KIS_APP_SECRET_",
     )
     full_prefixes = ("SYSTEM_TRADE_ACCOUNT_", "KIS_ACCOUNT_")
-    reserved_full_suffixes = {"ALIAS", "FULL", "NO", "NUMBER", "CODE"}
+    reserved_full_suffixes = {
+        "ALIAS",
+        "FULL",
+        "NO",
+        "NUMBER",
+        "CODE",
+        "APP_KEY",
+        "APP_SECRET",
+    }
 
     for name in os.environ:
         split_suffix = next((name[len(prefix):] for prefix in split_prefixes if name.startswith(prefix)), None)
@@ -288,6 +317,37 @@ def _load_account_bindings(account_alias: str | None) -> dict[str, AccountBindin
                 account_alias=alias,
                 account_no=account_no,
                 account_product_code=account_product_code,
+            )
+
+    return bindings
+
+
+def _load_credential_bindings(account_alias: str | None) -> dict[str, CredentialBinding]:
+    bindings: dict[str, CredentialBinding] = {}
+    for alias in sorted(_known_account_aliases(account_alias)):
+        suffix = _env_suffix(alias)
+        if not suffix:
+            continue
+
+        app_key = _first_env(
+            f"SYSTEM_TRADE_APP_KEY_{suffix}",
+            f"SYSTEM_TRADE_ACCOUNT_APP_KEY_{suffix}",
+            f"SYSTEM_TRADE_ACCOUNT_{suffix}_APP_KEY",
+            f"KIS_APP_KEY_{suffix}",
+            f"KIS_ACCOUNT_{suffix}_APP_KEY",
+        )
+        app_secret = _first_env(
+            f"SYSTEM_TRADE_APP_SECRET_{suffix}",
+            f"SYSTEM_TRADE_ACCOUNT_APP_SECRET_{suffix}",
+            f"SYSTEM_TRADE_ACCOUNT_{suffix}_APP_SECRET",
+            f"KIS_APP_SECRET_{suffix}",
+            f"KIS_ACCOUNT_{suffix}_APP_SECRET",
+        )
+        if app_key and app_secret:
+            bindings[alias] = CredentialBinding(
+                account_alias=alias,
+                kis_app_key=app_key,
+                kis_app_secret=app_secret,
             )
 
     return bindings
