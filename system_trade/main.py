@@ -20,6 +20,7 @@ from .exceptions import ConfigError, KISError
 from .kis_client import KISClient
 from .order_service import OrderService
 from .repository import MySQLRepository
+from .telegram_notifier import build_order_summary_message, send_telegram_message
 
 
 def _utcnow_naive() -> datetime:
@@ -528,11 +529,61 @@ def cmd_order(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_resubmit_order(args: argparse.Namespace) -> int:
+    _, lookup_repository = _new_repository()
+    order = lookup_repository.get_order_by_id(args.order_id)
+    if not order:
+        raise ConfigError(f"order_id={args.order_id} not found.")
+
+    account_alias = str(order.get("account_alias") or "")
+    if not account_alias:
+        raise ConfigError(f"order_id={args.order_id} has no account_alias.")
+    if args.expected_trade_date and str(order.get("trade_date")) != args.expected_trade_date:
+        raise ConfigError(
+            f"order_id={args.order_id} trade_date={order.get('trade_date')} "
+            f"does not match expected {args.expected_trade_date}."
+        )
+
+    settings, _, repository, service = _new_order_stack(account_alias=account_alias)
+    settings.require_account()
+    if not settings.kis_paper and not args.allow_live:
+        raise ConfigError("Live order resubmission is blocked by default. Re-run with --allow-live if intended.")
+    repository.ping()
+
+    latest_order = repository.get_order_by_id(args.order_id)
+    if not latest_order:
+        raise ConfigError(f"order_id={args.order_id} not found.")
+    result = service.resubmit_order(latest_order)
+    print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
+    return 0
+
+
 def cmd_list_orders(args: argparse.Namespace) -> int:
     _, repository = _new_repository()
     rows = repository.list_orders(limit=args.limit)
     print(json.dumps(rows, ensure_ascii=False, default=str, indent=2))
     return 0
+
+
+def cmd_notify_orders(args: argparse.Namespace) -> int:
+    _, repository = _new_repository()
+    trade_date = date.fromisoformat(args.trade_date)
+    rows = repository.list_orders_by_trade_date(trade_date=trade_date, limit=args.limit)
+    message = build_order_summary_message(rows, trade_date=trade_date)
+    if args.dry_run:
+        print(message)
+        return 0
+
+    result = send_telegram_message(message)
+    payload = {
+        "status": result.status,
+        "configured": result.configured,
+        "chat_id": result.chat_id,
+        "message_length": result.message_length,
+        "description": result.description,
+    }
+    print(json.dumps(payload, ensure_ascii=False, default=str, indent=2))
+    return 0 if result.status in {"sent", "skipped_missing_config"} else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -625,9 +676,21 @@ def build_parser() -> argparse.ArgumentParser:
     order.add_argument("--allow-live", action="store_true")
     order.set_defaults(func=cmd_order)
 
+    resubmit = sub.add_parser("resubmit-order", help="resubmit an existing unsubmitted order")
+    resubmit.add_argument("--order-id", type=int, required=True)
+    resubmit.add_argument("--expected-trade-date", help="guardrail: require stored trade_date YYYY-MM-DD")
+    resubmit.add_argument("--allow-live", action="store_true")
+    resubmit.set_defaults(func=cmd_resubmit_order)
+
     list_orders = sub.add_parser("list-orders", help="show recent orders")
     list_orders.add_argument("--limit", type=int, default=20)
     list_orders.set_defaults(func=cmd_list_orders)
+
+    notify_orders = sub.add_parser("notify-orders", help="send Telegram summary for a trade date")
+    notify_orders.add_argument("--trade-date", required=True, help="YYYY-MM-DD")
+    notify_orders.add_argument("--limit", type=int, default=100)
+    notify_orders.add_argument("--dry-run", action="store_true")
+    notify_orders.set_defaults(func=cmd_notify_orders)
 
     return parser
 

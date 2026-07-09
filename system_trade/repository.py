@@ -378,6 +378,9 @@ class MySQLRepository:
             "filled_quantity",
             "remaining_quantity",
             "avg_fill_price",
+            "order_type",
+            "quantity",
+            "price",
             "sent_at",
             "closed_at",
             "last_synced_at",
@@ -705,4 +708,17 @@ class MySQLRepository:
         with self._conn() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(sql, (int(limit),))
+                return list(cursor.fetchall())
+
+    def list_orders_by_trade_date(self, trade_date: date, limit: int = 100) -> list[dict[str, Any]]:
+        sql = """
+        SELECT *
+        FROM trade_orders
+        WHERE trade_date = %s
+        ORDER BY id DESC
+        LIMIT %s
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (trade_date, int(limit)))
                 return list(cursor.fetchall())

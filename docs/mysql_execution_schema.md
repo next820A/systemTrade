@@ -37,6 +37,38 @@ MySQL에 남기지 않는 것:
 
 이렇게 하면 BigQuery나 systemAlgo 산출물이 잠시 안 보여도 MySQL 원장만으로 주문 근거를 추적할 수 있다.
 
+### 주문 유형과 가격/수량 조정
+
+`systemAlgo`는 매수 주문 의도를 생성할 때 가능하면 `LIMIT` 주문으로 넘긴다. `MARKET`은 체결 편의성은 높지만, 계좌별 주문가능금액이 부족한 경우 KIS에서 `APBK0952` 같은 거절이 발생하기 쉽고 재전송 시에도 같은 문제가 반복된다.
+
+권장 흐름:
+
+1. systemAlgo가 기준가격을 정한다.
+2. 기준가격 또는 buffer 적용 가격을 `trade_orders.price`로 넘긴다.
+3. `order_type='LIMIT'`으로 넘긴다.
+4. 주문가능금액/가능수량을 알 수 있으면 `quantity`를 가능수량 이하로 줄여 intent를 만든다.
+5. 원래 목표수량, 기준가격, buffer, 잔여 현금 등은 `condition_snapshot.features`와 `intent_metadata`에 남긴다.
+
+권장 JSON 키:
+
+- `condition_snapshot.features.reference_price`
+- `condition_snapshot.features.price_buffer_pct`
+- `condition_snapshot.features.target_quantity`
+- `condition_snapshot.features.adjusted_quantity`
+- `condition_snapshot.features.residual_cash`
+- `intent_metadata.reference_price`
+- `intent_metadata.target_quantity`
+- `intent_metadata.adjusted_quantity`
+
+systemTrade의 현재 안전장치:
+
+- `BUY + MARKET` 주문이라도 `intent_metadata` 또는 `condition_snapshot.features`에 `limit_price`, `reference_price`, `buy_threshold_price` 중 하나가 있으면 실주문 직전에 `LIMIT`으로 변환한다.
+- 변환 가격으로 KIS 매수가능 조회를 수행하고, `max_buy_qty`가 원 주문수량보다 작으면 전송 수량을 줄인다.
+- 가능수량이 0이면 KIS 주문을 보내지 않고 `BUYING_POWER_EXHAUSTED`로 로컬 거절 처리한다.
+- 조정된 `order_type`, `quantity`, `price`는 `trade_orders`에 반영하고, 원본 주문 의도와 조정 내역은 `trade_order_events.request_payload.adjustment`에 남긴다.
+
+이 안전장치는 마지막 방어선이다. systemAlgo가 처음부터 `LIMIT + price + 가능수량 이하 quantity`를 넘기면 주문 의도와 실제 전송값이 더 명확해진다.
+
 ## 알고리즘별 계좌 분리
 
 초기 운영은 계좌 3개를 기준으로 둔다.

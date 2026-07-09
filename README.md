@@ -56,6 +56,21 @@ SYSTEM_TRADE_APP_KEY_HALFRISE=
 SYSTEM_TRADE_APP_SECRET_HALFRISE=
 ```
 
+### Telegram 거래 알림
+
+주문이 `SENT` 또는 `REJECTED`로 확정되면 Telegram 거래 모니터링 채널로 알림을 보냅니다. 민감한 bot token은 저장소에 커밋하지 않고 아래 secret file 또는 환경변수로 설정합니다.
+
+```bash
+mkdir -p "$HOME/Library/Application Support/systemTrade"
+cat > "$HOME/Library/Application Support/systemTrade/trading_telegram.env" <<'EOF'
+SYSTEM_TRADE_TELEGRAM_BOT_TOKEN=
+SYSTEM_TRADE_TELEGRAM_CHAT_ID=
+EOF
+chmod 600 "$HOME/Library/Application Support/systemTrade/trading_telegram.env"
+```
+
+환경변수 `SYSTEM_TRADE_TELEGRAM_ENV`로 secret file 위치를 바꿀 수 있습니다. 설정이 없거나 Telegram API 호출이 실패해도 주문 실행은 막지 않습니다.
+
 ## 주요 명령어
 
 ```bash
@@ -92,6 +107,9 @@ poetry run python -m system_trade.main order \
 
 # MySQL에 저장된 최근 주문 목록 확인
 poetry run python -m system_trade.main list-orders --limit 20
+
+# 특정 거래일 주문 이력을 Telegram으로 발송하기 전 미리보기
+poetry run python -m system_trade.main notify-orders --trade-date 2026-07-08 --dry-run
 ```
 
 ## 계좌 운용 기준
@@ -129,11 +147,29 @@ poetry run python -m system_trade.main list-orders --limit 20
 
 이 저장소 안에는 백테스팅 로직을 구현하지 않습니다.
 
+### systemAlgo 주문 유형 연계
+
+`systemAlgo`는 가능하면 주문 의도를 만들 때부터 매수 주문을 `LIMIT`으로 넘깁니다. 가격은 주문 생성 시점의 기준가격을 사용하고, `price`와 함께 `condition_snapshot` 또는 `intent_metadata`에도 추적 가능한 값을 남깁니다.
+
+권장 필드:
+
+- `order_type`: `LIMIT`
+- `price`: 실제 KIS에 넣을 지정가
+- `condition_snapshot.features.reference_price`: 전략이 사용한 기준가격
+- `condition_snapshot.features.price_buffer_pct`: 기준가격에 적용한 buffer가 있으면 기록
+- `intent_metadata.reference_price`: 운영 확인용 중복 기록
+
+현재 `systemAlgo`가 `MARKET`으로 넘긴 매수 주문도 systemTrade가 마지막 안전장치로 보정합니다. `BUY + MARKET` 주문에 `reference_price`, `buy_threshold_price`, `limit_price` 중 하나가 `intent_metadata` 또는 `condition_snapshot.features`에 있으면, 실주문 전 KIS 매수가능 조회를 `LIMIT` 기준으로 수행합니다. 가능수량이 원 주문수량보다 작으면 수량을 줄이고, 가능수량이 0이면 KIS 주문을 보내지 않고 `BUYING_POWER_EXHAUSTED`로 거절합니다.
+
+이 보정은 중복 주문 방지와 실주문 안전장치용입니다. 전략 의도와 주문 금액을 명확히 관리하려면 systemAlgo 쪽에서 처음부터 `LIMIT`, `price`, 조정된 `quantity`를 계산해 넘기는 구조가 우선입니다. systemTrade는 종목, 매수/매도 방향, 전략 의도를 임의로 바꾸지 않습니다.
+
 MySQL 스키마 기준은 [docs/mysql_execution_schema.md](/Users/dongjun/repo/systemTrade/docs/mysql_execution_schema.md)를 참고합니다.
 
 ## 고정 TR ID
 
-- 주문: `TTTC0012U` 매수, `TTTC0011U` 매도, `TTTC0013U` 정정/취소
+- 주문: `TTTC0802U` 매수, `TTTC0801U` 매도, `TTTC0013U` 정정/취소
+- 주문 fallback: `TTTC0012U` 매수, `TTTC0011U` 매도
+- 모의 주문: `VTTC0802U` 매수, `VTTC0801U` 매도
 - 주문 이력 조회: `TTTC0081R` (`inner`), `CTSC9215R` (`before`)
 - 잔고/가능수량 조회: `TTTC8434R`, `TTTC8908R`, `TTTC8408R`, `TTTC0084R`
 - 실시간 체결통보 WebSocket: `H0STCNI0` (모의투자는 `H0STCNI9`)

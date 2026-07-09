@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import fcntl
 import json
 import hashlib
+import os
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import requests
 
@@ -15,6 +18,7 @@ from .exceptions import KISError
 from .tr_ids import DEMO_TR_IDS, REAL_TR_IDS, TradingTRIDs
 
 TOKEN_SAFETY_MARGIN_SEC = 300
+TOKEN_RATE_LIMIT_RETRY_SEC = 65
 
 
 def extract_order_identifiers(response: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -45,7 +49,21 @@ class KISClient:
         self._token_expire_ts: float = 0
         self._lock = threading.Lock()
         self._token_cache_file = Path.home() / f".kis_token_cache_systemtrade_{self._token_cache_key()}.json"
+        self._token_lock_file = Path.home() / f".kis_token_issue_systemtrade_{self._token_issue_lock_key()}.lock"
         self._load_cached_token()
+
+    @contextmanager
+    def _token_issue_lock(self) -> Iterator[None]:
+        self._token_lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with self._token_lock_file.open("a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _has_valid_token(self) -> bool:
+        return bool(self._token and time.time() < self._token_expire_ts - TOKEN_SAFETY_MARGIN_SEC)
 
     def _load_cached_token(self) -> None:
         if not self._token_cache_file.exists():
@@ -65,9 +83,19 @@ class KISClient:
             "access_token": self._token,
             "token_expire_ts": self._token_expire_ts,
         }
+        tmp_file = self._token_cache_file.with_name(
+            f"{self._token_cache_file.name}.{os.getpid()}.tmp"
+        )
         try:
-            self._token_cache_file.write_text(json.dumps(payload), encoding="utf-8")
+            self._token_cache_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file.write_text(json.dumps(payload), encoding="utf-8")
+            tmp_file.chmod(0o600)
+            tmp_file.replace(self._token_cache_file)
         except Exception:
+            try:
+                tmp_file.unlink(missing_ok=True)
+            except Exception:
+                pass
             return
 
     def _token_cache_key(self) -> str:
@@ -80,7 +108,33 @@ class KISClient:
         )
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
-    def _issue_token(self) -> str:
+    def _token_issue_lock_key(self) -> str:
+        raw = "|".join(
+            [
+                self._settings.kis_base_url,
+                "paper" if self._settings.kis_paper else "real",
+            ]
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _is_token_rate_limit(payload: dict[str, Any], message: str) -> bool:
+        parts = [
+            message,
+            str(payload.get("error_description") or ""),
+            str(payload.get("msg1") or ""),
+            str(payload.get("msg_cd") or ""),
+            str(payload.get("error_code") or ""),
+        ]
+        text = " ".join(parts)
+        lowered = text.lower()
+        return (
+            ("1분당 1회" in text and ("접근토큰" in text or "token" in lowered))
+            or "too many requests" in lowered
+            or "rate limit" in lowered
+        )
+
+    def _post_token(self) -> tuple[int, dict[str, Any], str]:
         url = f"{self._settings.kis_base_url}/oauth2/tokenP"
         payload = {
             "grant_type": "client_credentials",
@@ -88,13 +142,13 @@ class KISClient:
             "appsecret": self._settings.kis_app_secret,
         }
         resp = requests.post(url, json=payload, timeout=20)
-        data = resp.json() if resp.text else {}
-        if resp.status_code >= 400:
-            msg = data.get("error_description") or resp.text
-            if self._token and time.time() < self._token_expire_ts - TOKEN_SAFETY_MARGIN_SEC:
-                return self._token
-            raise KISError("TOKEN", msg, payload=data)
+        try:
+            data = resp.json() if resp.text else {}
+        except ValueError:
+            data = {}
+        return resp.status_code, data, resp.text
 
+    def _apply_issued_token(self, data: dict[str, Any]) -> str:
         access_token = data.get("access_token") or data.get("accessToken")
         if not access_token:
             raise KISError("TOKEN", "access_token is missing", payload=data)
@@ -105,12 +159,50 @@ class KISClient:
         self._save_cached_token()
         return access_token
 
+    @staticmethod
+    def _token_error_message(data: dict[str, Any], raw_text: str) -> str:
+        return str(
+            data.get("error_description")
+            or data.get("msg1")
+            or data.get("message")
+            or raw_text
+            or "token request failed"
+        )
+
+    def _issue_token(self) -> str:
+        status_code, data, raw_text = self._post_token()
+        has_access_token = bool(data.get("access_token") or data.get("accessToken"))
+        if status_code < 400 and has_access_token:
+            return self._apply_issued_token(data)
+
+        msg = self._token_error_message(data, raw_text)
+        if status_code >= 400 or self._is_token_rate_limit(data, msg):
+            if self._has_valid_token():
+                return self._token
+            if self._is_token_rate_limit(data, msg):
+                time.sleep(TOKEN_RATE_LIMIT_RETRY_SEC)
+                self._load_cached_token()
+                if self._has_valid_token():
+                    return self._token
+
+                status_code, data, raw_text = self._post_token()
+                has_access_token = bool(data.get("access_token") or data.get("accessToken"))
+                if status_code < 400 and has_access_token:
+                    return self._apply_issued_token(data)
+                msg = self._token_error_message(data, raw_text)
+            raise KISError("TOKEN", msg, payload=data)
+
+        return self._apply_issued_token(data)
+
     def get_access_token(self) -> str:
         with self._lock:
-            now = time.time()
-            if self._token and now < self._token_expire_ts - TOKEN_SAFETY_MARGIN_SEC:
+            if self._has_valid_token():
                 return self._token
-            return self._issue_token()
+            with self._token_issue_lock():
+                self._load_cached_token()
+                if self._has_valid_token():
+                    return self._token
+                return self._issue_token()
 
     def _hashkey(self, body: dict[str, Any]) -> str:
         url = f"{self._settings.kis_base_url}/uapi/hashkey"
@@ -355,18 +447,103 @@ class KISClient:
             "EXCG_ID_DVSN_CD": "KRX",
         }
 
-        return self._request(
-            "POST",
-            "/uapi/domestic-stock/v1/trading/order-cash",
-            tr_id,
-            body=body,
-            use_hashkey=True,
-        )
+        attempted_tr_ids = [tr_id]
+        try:
+            response = self._request(
+                "POST",
+                "/uapi/domestic-stock/v1/trading/order-cash",
+                tr_id,
+                body=body,
+                use_hashkey=True,
+            )
+            return self._with_order_attempt_metadata(
+                response,
+                tr_id=tr_id,
+                attempted_tr_ids=attempted_tr_ids,
+            )
+        except KISError as exc:
+            fallback_tr_id = (
+                self._tr_ids.order_buy_fallback
+                if side == Side.BUY
+                else self._tr_ids.order_sell_fallback
+            )
+            if fallback_tr_id and fallback_tr_id != tr_id and self._is_rejected_tr_id_error(exc):
+                attempted_tr_ids.append(fallback_tr_id)
+                try:
+                    response = self._request(
+                        "POST",
+                        "/uapi/domestic-stock/v1/trading/order-cash",
+                        fallback_tr_id,
+                        body=body,
+                        use_hashkey=True,
+                    )
+                except KISError as fallback_exc:
+                    self._attach_order_attempt_metadata(
+                        fallback_exc,
+                        attempted_tr_ids=attempted_tr_ids,
+                        primary_error=exc,
+                    )
+                    raise
+                return self._with_order_attempt_metadata(
+                    response,
+                    tr_id=fallback_tr_id,
+                    attempted_tr_ids=attempted_tr_ids,
+                    primary_error=exc,
+                )
+            self._attach_order_attempt_metadata(exc, attempted_tr_ids=attempted_tr_ids)
+            raise
 
     @property
     def tr_ids(self) -> TradingTRIDs:
         return self._tr_ids
 
     @staticmethod
+    def _is_rejected_tr_id_error(exc: KISError) -> bool:
+        error_code = str(exc.error_code or exc.payload.get("msg_cd") or "").upper()
+        message = exc.message.lower()
+        return (
+            error_code == "EGW02005"
+            or "실전투자 tr" in message
+            or "모의투자 tr" in message
+        )
+
+    @staticmethod
     def _to_kis_order_code(order_type: OrderType) -> str:
         return "01" if order_type == OrderType.MARKET else "00"
+
+    @staticmethod
+    def _with_order_attempt_metadata(
+        payload: dict[str, Any],
+        *,
+        tr_id: str,
+        attempted_tr_ids: list[str],
+        primary_error: KISError | None = None,
+    ) -> dict[str, Any]:
+        enriched = dict(payload)
+        existing_meta = enriched.get("_systemtrade")
+        metadata = dict(existing_meta) if isinstance(existing_meta, dict) else {}
+        metadata["order_tr_id"] = tr_id
+        metadata["order_tr_id_attempts"] = list(attempted_tr_ids)
+        if primary_error is not None:
+            metadata["primary_order_error"] = {
+                "tr_id": primary_error.tr_id,
+                "error_code": primary_error.error_code,
+                "message": primary_error.message,
+                "payload": primary_error.payload,
+            }
+        enriched["_systemtrade"] = metadata
+        return enriched
+
+    def _attach_order_attempt_metadata(
+        self,
+        exc: KISError,
+        *,
+        attempted_tr_ids: list[str],
+        primary_error: KISError | None = None,
+    ) -> None:
+        exc.payload = self._with_order_attempt_metadata(
+            exc.payload,
+            tr_id=exc.tr_id,
+            attempted_tr_ids=attempted_tr_ids,
+            primary_error=primary_error,
+        )
