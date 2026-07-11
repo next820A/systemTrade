@@ -15,6 +15,37 @@ def test_settings_infers_real_mode_from_base_url(monkeypatch) -> None:
     assert settings.kis_paper is False
 
 
+def test_settings_env_file_overrides_inherited_kis_mode(monkeypatch, tmp_path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "KIS_APP_KEY=file-key",
+                "KIS_APP_SECRET=file-secret",
+                "KIS_PAPER=0",
+                "KIS_BASE_URL=https://openapi.koreainvestment.com:9443",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("KIS_PAPER", "1")
+
+    settings = Settings.load(str(env_file))
+
+    assert settings.kis_paper is False
+    assert settings.kis_base_url == "https://openapi.koreainvestment.com:9443"
+
+
+def test_settings_rejects_mismatched_kis_mode_and_endpoint(monkeypatch) -> None:
+    monkeypatch.setenv("KIS_APP_KEY", "test-key")
+    monkeypatch.setenv("KIS_APP_SECRET", "test-secret")
+    monkeypatch.setenv("KIS_PAPER", "1")
+    monkeypatch.setenv("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443")
+
+    with pytest.raises(ConfigError, match="KIS_PAPER conflicts"):
+        Settings.load("")
+
+
 def test_settings_parses_full_account_value(monkeypatch) -> None:
     monkeypatch.setenv("KIS_APP_KEY", "test-key")
     monkeypatch.setenv("KIS_APP_SECRET", "test-secret")

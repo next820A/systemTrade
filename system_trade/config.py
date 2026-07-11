@@ -23,12 +23,33 @@ def _infer_kis_paper(explicit_value: str | None, base_url: str | None) -> bool:
     if explicit_value is not None:
         return explicit_value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
+    endpoint_mode = _kis_endpoint_paper_mode(base_url)
+    if endpoint_mode is not None:
+        return endpoint_mode
+
+    return False
+
+
+def _kis_endpoint_paper_mode(base_url: str | None) -> bool | None:
     normalized = (base_url or "").strip().lower()
     if "openapivts" in normalized:
         return True
     if "openapi.koreainvestment.com" in normalized:
         return False
-    return False
+    return None
+
+
+def _validate_kis_mode(kis_paper: bool, base_url: str) -> None:
+    endpoint_mode = _kis_endpoint_paper_mode(base_url)
+    if endpoint_mode is None or endpoint_mode == kis_paper:
+        return
+
+    configured_mode = "paper" if kis_paper else "real"
+    endpoint_mode_name = "paper" if endpoint_mode else "real"
+    raise ConfigError(
+        "KIS_PAPER conflicts with KIS_BASE_URL: "
+        f"KIS_PAPER selects {configured_mode}, but {base_url} is a {endpoint_mode_name} endpoint."
+    )
 
 
 @dataclass(frozen=True)
@@ -67,7 +88,7 @@ class Settings:
     def load(cls, explicit_env_file: str | None = None, require_kis: bool = True) -> "Settings":
         env_path = _discover_env_file(explicit_env_file)
         if env_path:
-            load_dotenv(env_path, override=False)
+            load_dotenv(env_path, override=True)
 
         kis_app_key = os.getenv("KIS_APP_KEY", "").strip()
         kis_app_secret = os.getenv("KIS_APP_SECRET", "").strip()
@@ -81,6 +102,7 @@ class Settings:
             else "https://openapi.koreainvestment.com:9443"
         )
         kis_base_url = raw_base_url or default_base_url
+        _validate_kis_mode(kis_paper, kis_base_url)
 
         (
             derived_account_no,

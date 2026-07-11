@@ -479,9 +479,16 @@ def cmd_cancelable_orders(args: argparse.Namespace) -> int:
 
 
 def cmd_tr_ids(args: argparse.Namespace) -> int:
-    settings = Settings.load(require_kis=False)
-    kis_client = KISClient(settings)
+    if args.account_alias:
+        settings, kis_client, _, _ = _new_order_stack(
+            account_alias=args.account_alias,
+            require_kis=False,
+        )
+    else:
+        settings = Settings.load(require_kis=False)
+        kis_client = KISClient(settings)
     payload = {
+        "account_alias": settings.account_alias,
         "kis_paper": settings.kis_paper,
         "kis_base_url": settings.kis_base_url,
         "tr_ids": kis_client.tr_ids.__dict__,
@@ -595,6 +602,7 @@ def build_parser() -> argparse.ArgumentParser:
     health.set_defaults(func=cmd_health_check)
 
     tr_ids = sub.add_parser("tr-ids", help="show the fixed KIS TR ID set")
+    tr_ids.add_argument("--account-alias")
     tr_ids.set_defaults(func=cmd_tr_ids)
 
     init_db = sub.add_parser("init-db", help="apply mysql migration")
