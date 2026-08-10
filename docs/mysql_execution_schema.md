@@ -41,6 +41,10 @@ MySQL에 남기지 않는 것:
 
 `systemAlgo`는 매수 주문 의도를 생성할 때 가능하면 `LIMIT` 주문으로 넘긴다. `MARKET`은 체결 편의성은 높지만, 계좌별 주문가능금액이 부족한 경우 KIS에서 `APBK0952` 같은 거절이 발생하기 쉽고 재전송 시에도 같은 문제가 반복된다.
 
+ETF 파킹 자금을 개별주로 교체하는 운영 배치는 ETF와 전략 청산 주문을 먼저 `LIMIT`으로 제출한다. `sync-orders`가 KIS 일별 체결 결과를 `trade_orders.filled_quantity`, `remaining_quantity`, `avg_fill_price`, `status`에 반영하고, 관련 매도가 모두 `FILLED`가 된 뒤 잔고를 다시 저장한다. 갱신된 `cash_available`로 매수 수량을 다시 계산하기 전에는 후속 매수를 제출하지 않는다.
+
+미체결 지정가 주문은 KIS 정정취소가능수량(`psbl_qty`)을 확인한 뒤 정정 API로 가격만 변경한다. 매수는 최우선 매도호가, 매도는 최우선 매수호가를 사용하되 최초 지정가 기준 허용 범위를 넘는 호가는 추격하지 않는다. 정정 결과의 새 주문번호와 가격은 `trade_orders`에 반영하고 이전/새 가격, 기준가격, 허용범위, 최우선호가는 `trade_order_events`의 `REPRICED` 이벤트에 남긴다.
+
 권장 흐름:
 
 1. systemAlgo가 기준가격을 정한다.
@@ -62,9 +66,11 @@ MySQL에 남기지 않는 것:
 
 systemTrade의 현재 안전장치:
 
+- `BUY + LIMIT`은 지정가로 KIS 매수가능 조회를 수행한다.
 - `BUY + MARKET` 주문이라도 `intent_metadata` 또는 `condition_snapshot.features`에 `limit_price`, `reference_price`, `buy_threshold_price` 중 하나가 있으면 실주문 직전에 `LIMIT`으로 변환한다.
-- 변환 가격으로 KIS 매수가능 조회를 수행하고, `max_buy_qty`가 원 주문수량보다 작으면 전송 수량을 줄인다.
+- 확인 가격의 `max_buy_qty`가 원 주문수량보다 작으면 전송 수량을 줄인다.
 - 가능수량이 0이면 KIS 주문을 보내지 않고 `BUYING_POWER_EXHAUSTED`로 로컬 거절 처리한다.
+- 매수가능 조회가 실패하거나 가능수량 필드가 없으면 안전하게 로컬 거절 처리한다.
 - 조정된 `order_type`, `quantity`, `price`는 `trade_orders`에 반영하고, 원본 주문 의도와 조정 내역은 `trade_order_events.request_payload.adjustment`에 남긴다.
 
 이 안전장치는 마지막 방어선이다. systemAlgo가 처음부터 `LIMIT + price + 가능수량 이하 quantity`를 넘기면 주문 의도와 실제 전송값이 더 명확해진다.

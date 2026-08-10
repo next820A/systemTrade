@@ -302,6 +302,26 @@ class MySQLRepository:
                 cursor.execute(sql, (order_id,))
                 return cursor.fetchone()
 
+    def list_orders_for_account_trade_date(
+        self,
+        *,
+        account_no: str,
+        trade_date: date,
+    ) -> list[dict[str, Any]]:
+        sql = """
+        SELECT *
+        FROM trade_orders
+        WHERE broker = 'KIS'
+          AND account_no = %s
+          AND trade_date = %s
+          AND broker_order_no IS NOT NULL
+        ORDER BY id
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (account_no, trade_date))
+                return list(cursor.fetchall())
+
     def create_order(self, payload: dict[str, Any]) -> int:
         sql = """
         INSERT INTO trade_orders (

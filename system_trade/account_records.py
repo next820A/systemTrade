@@ -128,13 +128,15 @@ def cancelable_rows_from_response(payload: dict[str, Any]) -> list[dict[str, Any
         rows.append(
             {
                 "broker_order_no": clean_text(pick(row, "odno", "ODNO", "ord_no")),
-                "broker_org_order_no": clean_text(pick(row, "orgn_odno", "ORGN_ODNO")),
+                "broker_org_order_no": clean_text(pick(row, "ord_gno_brno", "ORD_GNO_BRNO")),
+                "original_broker_order_no": clean_text(pick(row, "orgn_odno", "ORGN_ODNO")),
                 "side": side_or_none(pick(row, "sll_buy_dvsn_cd", "sll_buy_dvsn_cd_name", "ord_dvsn_name")),
                 "symbol": clean_text(pick(row, "pdno", "PDNO")),
                 "order_type": clean_text(pick(row, "ord_dvsn_cd", "ord_dvsn_name")),
                 "order_quantity": int_or_none(pick(row, "ord_qty", "ORD_QTY")),
-                "unfilled_quantity": int_or_none(pick(row, "rmn_qty", "tot_ccld_qty", "unfilled_qty")),
+                "unfilled_quantity": int_or_none(pick(row, "psbl_qty", "rmn_qty", "unfilled_qty")),
                 "order_price": decimal_or_none(pick(row, "ord_unpr", "ORD_UNPR")),
+                "exchange_id": clean_text(pick(row, "excg_id_dvsn_cd", "EXCG_ID_DVSN_CD")),
                 "raw_payload": row,
             }
         )

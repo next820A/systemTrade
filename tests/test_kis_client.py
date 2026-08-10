@@ -83,6 +83,30 @@ def test_kis_client_uses_fixed_demo_cash_order_tr_ids() -> None:
     assert client.tr_ids.order_sell_fallback == "VTTC0011U"
 
 
+def test_get_asking_price_uses_domestic_orderbook_endpoint(monkeypatch) -> None:
+    from system_trade.kis_client import KISClient
+
+    client = KISClient(_settings())
+    calls: list[tuple[object, ...]] = []
+
+    def fake_request(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"output1": {"askp1": "70100", "bidp1": "70000"}}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    result = client.get_asking_price("005930")
+
+    assert result["output1"]["askp1"] == "70100"
+    args, kwargs = calls[0]
+    assert args[:3] == (
+        "GET",
+        "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn",
+        "FHKST01010200",
+    )
+    assert kwargs["params"]["FID_INPUT_ISCD"] == "005930"
+
+
 def test_kis_client_token_cache_is_scoped_to_app_key() -> None:
     from dataclasses import replace
 

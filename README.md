@@ -89,6 +89,14 @@ poetry run python -m system_trade.main balance --account-alias hagfish
 # 일자별 주문/체결 이력 조회
 poetry run python -m system_trade.main daily-ccld --account-alias hagfish --start-date 20260301 --end-date 20260307
 
+# KIS 일별 체결을 조회하고 해당 계좌/거래일의 로컬 주문 상태를 동기화
+poetry run python -m system_trade.main sync-orders --account-alias hagfish --trade-date 2026-07-21
+
+# 미체결 지정가 주문을 현재 최우선호가로 정정하되 최초 가격 대비 1% 범위로 제한
+poetry run python -m system_trade.main reprice-order \
+  --order-id 45 --anchor-price 104095 --max-deviation-pct 0.01 \
+  --expected-trade-date 2026-07-21 --allow-live
+
 # 특정 종목/가격 기준 매수 가능 수량 조회
 poetry run python -m system_trade.main buying-power --account-alias hagfish --symbol 005930 --price 70000 --order-type LIMIT
 
@@ -159,7 +167,7 @@ poetry run python -m system_trade.main notify-orders --trade-date 2026-07-08 --d
 - `condition_snapshot.features.price_buffer_pct`: 기준가격에 적용한 buffer가 있으면 기록
 - `intent_metadata.reference_price`: 운영 확인용 중복 기록
 
-현재 `systemAlgo`가 `MARKET`으로 넘긴 매수 주문도 systemTrade가 마지막 안전장치로 보정합니다. `BUY + MARKET` 주문에 `reference_price`, `buy_threshold_price`, `limit_price` 중 하나가 `intent_metadata` 또는 `condition_snapshot.features`에 있으면, 실주문 전 KIS 매수가능 조회를 `LIMIT` 기준으로 수행합니다. 가능수량이 원 주문수량보다 작으면 수량을 줄이고, 가능수량이 0이면 KIS 주문을 보내지 않고 `BUYING_POWER_EXHAUSTED`로 거절합니다.
+systemTrade는 마지막 안전장치로 가격을 확인할 수 있는 모든 매수 주문에 대해 실주문 직전 KIS 매수가능 조회를 수행합니다. `BUY + LIMIT`은 주문 가격을 그대로 사용하고, `BUY + MARKET`은 `reference_price`, `buy_threshold_price`, `limit_price` 중 하나가 `intent_metadata` 또는 `condition_snapshot.features`에 있으면 해당 가격의 `LIMIT` 주문으로 변환합니다. 가능수량이 원 주문수량보다 작으면 수량을 줄이고, 가능수량이 0이거나 조회 결과를 신뢰할 수 없으면 KIS 주문을 보내지 않고 로컬에서 거절합니다.
 
 이 보정은 중복 주문 방지와 실주문 안전장치용입니다. 전략 의도와 주문 금액을 명확히 관리하려면 systemAlgo 쪽에서 처음부터 `LIMIT`, `price`, 조정된 `quantity`를 계산해 넘기는 구조가 우선입니다. systemTrade는 종목, 매수/매도 방향, 전략 의도를 임의로 바꾸지 않습니다.
 

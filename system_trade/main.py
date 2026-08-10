@@ -15,7 +15,7 @@ from .account_records import (
     sellable_from_response,
 )
 from .config import Settings
-from .domain import OrderRequest, OrderType, Side
+from .domain import OrderRequest, OrderStatus, OrderType, Side
 from .exceptions import ConfigError, KISError
 from .kis_client import KISClient
 from .order_service import OrderService
@@ -362,6 +362,47 @@ def cmd_daily_ccld(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync_orders(args: argparse.Namespace) -> int:
+    settings, kis_client, repository, service = _new_stack(account_alias=args.account_alias)
+    trade_date = date.fromisoformat(args.trade_date)
+    requested_at = _utcnow_naive()
+    payload = kis_client.get_daily_ccld(
+        start_date=trade_date.strftime("%Y%m%d"),
+        end_date=trade_date.strftime("%Y%m%d"),
+        query_scope="inner",
+        side_filter="00",
+        symbol="",
+        fill_filter="00",
+        sort_order="00",
+        asset_filter="00",
+    )
+    responded_at = _utcnow_naive()
+    query_request_id = _save_query_request(
+        repository,
+        settings,
+        "DAILY_CCLD",
+        request_payload={"command": "sync-orders", "trade_date": trade_date.isoformat()},
+        response_payload=payload,
+        requested_at=requested_at,
+        responded_at=responded_at,
+        account_alias=settings.account_alias,
+        start_date=trade_date,
+        end_date=trade_date,
+    )
+    rows = [
+        {
+            **row,
+            "query_request_id": query_request_id,
+            "account_no": settings.kis_account_no,
+        }
+        for row in execution_rows_from_response(payload)
+    ]
+    repository.insert_broker_execution_snapshots(rows)
+    result = service.sync_daily_executions(trade_date=trade_date, response=payload)
+    print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
+    return 0
+
+
 def cmd_buying_power(args: argparse.Namespace) -> int:
     settings, kis_client, repository, _ = _new_stack(account_alias=args.account_alias)
     requested_at = _utcnow_naive()
@@ -533,7 +574,7 @@ def cmd_order(args: argparse.Namespace) -> int:
     )
     order = service.record_order_intent(request) if args.record_only else service.submit_order(request)
     print(json.dumps(order, ensure_ascii=False, default=str, indent=2))
-    return 0
+    return _order_result_exit_code(order, record_only=bool(args.record_only))
 
 
 def cmd_resubmit_order(args: argparse.Namespace) -> int:
@@ -562,7 +603,47 @@ def cmd_resubmit_order(args: argparse.Namespace) -> int:
         raise ConfigError(f"order_id={args.order_id} not found.")
     result = service.resubmit_order(latest_order)
     print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
+    return _order_result_exit_code(result, record_only=False)
+
+
+def cmd_reprice_order(args: argparse.Namespace) -> int:
+    _, lookup_repository = _new_repository()
+    order = lookup_repository.get_order_by_id(args.order_id)
+    if not order:
+        raise ConfigError(f"order_id={args.order_id} not found.")
+
+    account_alias = str(order.get("account_alias") or "")
+    if not account_alias:
+        raise ConfigError(f"order_id={args.order_id} has no account_alias.")
+    if args.expected_trade_date and str(order.get("trade_date")) != args.expected_trade_date:
+        raise ConfigError(
+            f"order_id={args.order_id} trade_date={order.get('trade_date')} "
+            f"does not match expected {args.expected_trade_date}."
+        )
+
+    settings, _, repository, service = _new_order_stack(account_alias=account_alias)
+    settings.require_account()
+    if not settings.kis_paper and not args.allow_live:
+        raise ConfigError("Live order repricing is blocked by default. Re-run with --allow-live if intended.")
+    repository.ping()
+
+    latest_order = repository.get_order_by_id(args.order_id)
+    if not latest_order:
+        raise ConfigError(f"order_id={args.order_id} not found.")
+    result = service.reprice_order(
+        latest_order,
+        anchor_price=int(args.anchor_price),
+        max_deviation_pct=float(args.max_deviation_pct),
+    )
+    print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
     return 0
+
+
+def _order_result_exit_code(order: dict[str, object], *, record_only: bool) -> int:
+    if record_only:
+        return 0
+    status = str(order.get("status") or "")
+    return 1 if status in {OrderStatus.REJECTED.value, OrderStatus.FAILED.value} else 0
 
 
 def cmd_list_orders(args: argparse.Namespace) -> int:
@@ -637,6 +718,11 @@ def build_parser() -> argparse.ArgumentParser:
     daily_ccld.add_argument("--save", action="store_true", help="persist sanitized query records to MySQL")
     daily_ccld.set_defaults(func=cmd_daily_ccld)
 
+    sync_orders = sub.add_parser("sync-orders", help="sync local order fill status from KIS daily executions")
+    sync_orders.add_argument("--trade-date", required=True, help="YYYY-MM-DD")
+    sync_orders.add_argument("--account-alias", required=True)
+    sync_orders.set_defaults(func=cmd_sync_orders)
+
     buying_power = sub.add_parser("buying-power", help="query buyable amount/quantity")
     buying_power.add_argument("--symbol", required=True)
     buying_power.add_argument("--account-alias")
@@ -689,6 +775,14 @@ def build_parser() -> argparse.ArgumentParser:
     resubmit.add_argument("--expected-trade-date", help="guardrail: require stored trade_date YYYY-MM-DD")
     resubmit.add_argument("--allow-live", action="store_true")
     resubmit.set_defaults(func=cmd_resubmit_order)
+
+    reprice = sub.add_parser("reprice-order", help="bounded LIMIT order repricing from current best quote")
+    reprice.add_argument("--order-id", type=int, required=True)
+    reprice.add_argument("--anchor-price", type=int, required=True)
+    reprice.add_argument("--max-deviation-pct", type=float, required=True)
+    reprice.add_argument("--expected-trade-date", help="guardrail: require stored trade_date YYYY-MM-DD")
+    reprice.add_argument("--allow-live", action="store_true")
+    reprice.set_defaults(func=cmd_reprice_order)
 
     list_orders = sub.add_parser("list-orders", help="show recent orders")
     list_orders.add_argument("--limit", type=int, default=20)

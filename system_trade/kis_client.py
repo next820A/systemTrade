@@ -267,6 +267,17 @@ class KISClient:
             },
         )
 
+    def get_asking_price(self, symbol: str) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn",
+            "FHKST01010200",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": symbol,
+            },
+        )
+
     def get_stock_balance(self) -> dict[str, Any]:
         self._settings.require_account()
         return self._request(

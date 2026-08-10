@@ -6,7 +6,7 @@ import pytest
 
 from system_trade.config import Settings
 from system_trade.exceptions import ConfigError
-from system_trade.main import _resolve_runtime_account
+from system_trade.main import _order_result_exit_code, _resolve_runtime_account
 
 
 class FakeRepository:
@@ -59,3 +59,9 @@ def test_runtime_account_requires_bound_db_alias() -> None:
 
     with pytest.raises(ConfigError, match="bind-account"):
         _resolve_runtime_account(_settings(), repository)  # type: ignore[arg-type]
+
+
+def test_live_order_cli_returns_failure_for_rejected_order() -> None:
+    assert _order_result_exit_code({"status": "REJECTED"}, record_only=False) == 1
+    assert _order_result_exit_code({"status": "SENT"}, record_only=False) == 0
+    assert _order_result_exit_code({"status": "REJECTED"}, record_only=True) == 0

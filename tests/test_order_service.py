@@ -26,11 +26,21 @@ class FakeSettings:
 
 
 class FakeKISClient:
-    def __init__(self, settings: FakeSettings, *, buying_power: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        settings: FakeSettings,
+        *,
+        buying_power: dict[str, Any] | None = None,
+        asking_price: dict[str, Any] | None = None,
+        cancelable_orders: dict[str, Any] | None = None,
+    ):
         self._settings = settings
         self.buying_power = buying_power
+        self.asking_price = asking_price or {"output1": {}}
+        self.cancelable_orders = cancelable_orders or {"output": []}
         self.buying_power_requests: list[dict[str, Any]] = []
         self.orders: list[dict[str, Any]] = []
+        self.revisions: list[dict[str, Any]] = []
 
     def get_buying_power(self, **payload: Any) -> dict[str, Any]:
         self.buying_power_requests.append(payload)
@@ -39,6 +49,18 @@ class FakeKISClient:
     def place_cash_order(self, **payload: Any) -> dict[str, Any]:
         self.orders.append(payload)
         return {"output": {"ODNO": "12345", "KRX_FWDG_ORD_ORGNO": "67890"}}
+
+    def get_asking_price(self, symbol: str) -> dict[str, Any]:
+        self.asked_symbol = symbol
+        return self.asking_price
+
+    def get_cancelable_orders(self, **payload: Any) -> dict[str, Any]:
+        self.cancelable_request = payload
+        return self.cancelable_orders
+
+    def revise_or_cancel_order(self, **payload: Any) -> dict[str, Any]:
+        self.revisions.append(payload)
+        return {"output": {"ODNO": "54321", "KRX_FWDG_ORD_ORGNO": "06010"}}
 
 
 class RejectingKISClient(FakeKISClient):
@@ -60,6 +82,16 @@ class RejectingKISClient(FakeKISClient):
         )
 
 
+class BuyingPowerErrorKISClient(FakeKISClient):
+    def get_buying_power(self, **payload: Any) -> dict[str, Any]:
+        self.buying_power_requests.append(payload)
+        raise KISError(
+            "TTTC8908R",
+            "buying power unavailable",
+            error_code="RATE_LIMIT",
+        )
+
+
 class FakeRepository:
     def __init__(
         self,
@@ -77,6 +109,7 @@ class FakeRepository:
         self.created_payload: dict[str, Any] | None = None
         self.events: list[dict[str, Any]] = []
         self.status_updates: list[tuple[int, Any, dict[str, Any]]] = []
+        self.execution_orders: list[dict[str, Any]] = []
 
     def find_active_trade_account(self, **kwargs: Any) -> dict[str, Any] | None:
         self.account_lookup = kwargs
@@ -99,10 +132,17 @@ class FakeRepository:
 
     def update_order_status(self, order_id: int, status: Any, **updates: Any) -> None:
         self.status_updates.append((order_id, status, updates))
+        for order in self.execution_orders:
+            if int(order.get("id") or 0) == order_id:
+                order.update(updates)
+                order["status"] = status.value if hasattr(status, "value") else str(status)
 
     def get_order_by_id(self, order_id: int) -> dict[str, Any] | None:
         status = self.status_updates[-1][1].value if self.status_updates else "SENT"
         return {"id": order_id, "status": status, "trade_account_id": 7}
+
+    def list_orders_for_account_trade_date(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self.execution_orders
 
 
 @pytest.fixture(autouse=True)
@@ -368,6 +408,284 @@ def test_market_buy_with_no_buying_power_rejects_before_order_submit() -> None:
     assert repository.status_updates[0][1] == OrderStatus.REJECTED
     assert repository.status_updates[0][2]["error_code"] == "BUYING_POWER_EXHAUSTED"
     assert repository.events[-1]["event_type"] == "REJECTED"
+
+
+def test_limit_buy_caps_quantity_to_current_buying_power() -> None:
+    repository = FakeRepository()
+    kis_client = FakeKISClient(
+        FakeSettings(),
+        buying_power={
+            "output": {
+                "max_buy_qty": "128",
+                "ord_psbl_cash": "433637",
+            }
+        },
+    )
+    service = OrderService(repository=repository, kis_client=kis_client)  # type: ignore[arg-type]
+
+    order = service.submit_order(
+        _request(
+            symbol="018880",
+            quantity=290,
+            order_type=OrderType.LIMIT,
+            price=3385,
+        )
+    )
+
+    assert order["status"] == "SENT"
+    assert kis_client.buying_power_requests == [
+        {
+            "symbol": "018880",
+            "price": 3385,
+            "order_type": OrderType.LIMIT,
+        }
+    ]
+    assert kis_client.orders == [
+        {
+            "side": Side.BUY,
+            "symbol": "018880",
+            "quantity": 128,
+            "order_type": OrderType.LIMIT,
+            "price": 3385,
+        }
+    ]
+    adjustment = repository.events[1]["request_payload"]["adjustment"]
+    assert adjustment["reason"] == "limit_buy_capped_to_buying_power"
+    assert adjustment["adjusted_quantity"] == 128
+    assert repository.status_updates[0][2]["quantity"] == 128
+
+
+def test_limit_buy_with_zero_buying_power_rejects_before_submit() -> None:
+    repository = FakeRepository()
+    kis_client = FakeKISClient(
+        FakeSettings(),
+        buying_power={"output": {"max_buy_qty": "0", "ord_psbl_cash": "0"}},
+    )
+    service = OrderService(repository=repository, kis_client=kis_client)  # type: ignore[arg-type]
+
+    order = service.submit_order(
+        _request(quantity=3, order_type=OrderType.LIMIT, price=102000)
+    )
+
+    assert order["status"] == "REJECTED"
+    assert not kis_client.orders
+    assert repository.status_updates[0][2]["error_code"] == "BUYING_POWER_EXHAUSTED"
+    assert repository.events[-1]["note"] == "buying_power_exhausted_before_submit"
+
+
+def test_limit_buy_blocks_when_buying_power_check_fails() -> None:
+    repository = FakeRepository()
+    kis_client = BuyingPowerErrorKISClient(FakeSettings())
+    service = OrderService(repository=repository, kis_client=kis_client)  # type: ignore[arg-type]
+
+    order = service.submit_order(
+        _request(quantity=3, order_type=OrderType.LIMIT, price=102000)
+    )
+
+    assert order["status"] == "REJECTED"
+    assert not kis_client.orders
+    assert repository.status_updates[0][2]["error_code"] == "BUYING_POWER_CHECK_FAILED"
+    assert repository.events[-1]["note"] == "buying_power_check_failed"
+
+
+def test_sync_daily_executions_marks_matching_order_filled() -> None:
+    repository = FakeRepository()
+    repository.execution_orders = [
+        {
+            "id": 45,
+            "broker_order_no": "00012345",
+            "side": "SELL",
+            "symbol": "069500",
+            "quantity": 11,
+            "filled_quantity": 0,
+            "remaining_quantity": 11,
+            "status": "SENT",
+        }
+    ]
+    kis_client = FakeKISClient(FakeSettings())
+    service = OrderService(repository=repository, kis_client=kis_client)  # type: ignore[arg-type]
+
+    result = service.sync_daily_executions(
+        trade_date=datetime(2026, 7, 21).date(),
+        response={
+            "output1": [
+                {
+                    "odno": "00012345",
+                    "sll_buy_dvsn_cd_name": "매도",
+                    "pdno": "069500",
+                    "ord_qty": "11",
+                    "tot_ccld_qty": "11",
+                    "avg_prvs": "104095",
+                    "tot_ccld_amt": "1145045",
+                }
+            ]
+        },
+    )
+
+    assert result["synced_order_ids"] == [45]
+    assert result["orders"][0]["status"] == "FILLED"
+    assert repository.status_updates[0][1] == OrderStatus.FILLED
+    assert repository.status_updates[0][2]["filled_quantity"] == 11
+    assert repository.status_updates[0][2]["remaining_quantity"] == 0
+    assert repository.events[-1]["event_type"] == "FILL_SYNCED"
+
+
+def test_sync_daily_executions_keeps_partial_fill_open() -> None:
+    repository = FakeRepository()
+    repository.execution_orders = [
+        {
+            "id": 46,
+            "broker_order_no": "00012346",
+            "side": "SELL",
+            "symbol": "069500",
+            "quantity": 11,
+            "filled_quantity": 0,
+            "remaining_quantity": 11,
+            "status": "SENT",
+        }
+    ]
+    service = OrderService(
+        repository=repository,  # type: ignore[arg-type]
+        kis_client=FakeKISClient(FakeSettings()),  # type: ignore[arg-type]
+    )
+
+    result = service.sync_daily_executions(
+        trade_date=datetime(2026, 7, 21).date(),
+        response={
+            "output1": [
+                {
+                    "odno": "00012346",
+                    "pdno": "069500",
+                    "ord_qty": "11",
+                    "tot_ccld_qty": "5",
+                    "avg_prvs": "104095",
+                }
+            ]
+        },
+    )
+
+    assert result["orders"][0]["status"] == "PARTIALLY_FILLED"
+    assert result["orders"][0]["filled_quantity"] == 5
+    assert result["orders"][0]["remaining_quantity"] == 6
+
+
+def test_sync_daily_executions_accumulates_fill_after_partial_order_reprice() -> None:
+    repository = FakeRepository()
+    repository.execution_orders = [
+        {
+            "id": 47,
+            "broker_order_no": "00054321",
+            "side": "SELL",
+            "symbol": "069500",
+            "quantity": 11,
+            "filled_quantity": 5,
+            "remaining_quantity": 6,
+            "avg_fill_price": "104000",
+            "status": "PARTIALLY_FILLED",
+        }
+    ]
+    service = OrderService(
+        repository=repository,  # type: ignore[arg-type]
+        kis_client=FakeKISClient(FakeSettings()),  # type: ignore[arg-type]
+    )
+
+    result = service.sync_daily_executions(
+        trade_date=datetime(2026, 7, 21).date(),
+        response={
+            "output1": [
+                {
+                    "odno": "00054321",
+                    "pdno": "069500",
+                    "ord_qty": "6",
+                    "tot_ccld_qty": "6",
+                    "avg_prvs": "103800",
+                }
+            ]
+        },
+    )
+
+    assert result["orders"][0]["status"] == "FILLED"
+    assert result["orders"][0]["filled_quantity"] == 11
+    assert result["orders"][0]["remaining_quantity"] == 0
+    assert float(repository.status_updates[0][2]["avg_fill_price"]) == pytest.approx(103890.9091)
+
+
+def test_reprice_sell_order_moves_to_best_bid_within_bound() -> None:
+    repository = FakeRepository()
+    kis_client = FakeKISClient(
+        FakeSettings(),
+        asking_price={"output1": {"bidp1": "103800", "askp1": "103805"}},
+        cancelable_orders={
+            "output": [
+                {
+                    "ord_gno_brno": "06010",
+                    "odno": "00012345",
+                    "orgn_odno": "",
+                    "pdno": "069500",
+                    "psbl_qty": "11",
+                    "sll_buy_dvsn_cd": "01",
+                    "excg_id_dvsn_cd": "KRX",
+                }
+            ]
+        },
+    )
+    service = OrderService(repository=repository, kis_client=kis_client)  # type: ignore[arg-type]
+
+    result = service.reprice_order(
+        _stored_order(
+            side="SELL",
+            symbol="069500",
+            order_type="LIMIT",
+            quantity=11,
+            price=104095,
+            status="SENT",
+            broker_order_no="00012345",
+            broker_org_order_no="06010",
+        ),
+        anchor_price=104095,
+        max_deviation_pct=0.01,
+    )
+
+    assert result["action"] == "repriced"
+    assert result["new_price"] == 103800
+    assert kis_client.revisions == [
+        {
+            "original_order_no": "00012345",
+            "revise_or_cancel_code": "01",
+            "quantity": 11,
+            "price": 103800,
+            "order_type": OrderType.LIMIT,
+            "exchange_id": "KRX",
+            "original_org_no": "06010",
+            "all_quantity": True,
+        }
+    ]
+    assert repository.status_updates[-1][2]["broker_order_no"] == "54321"
+    assert repository.events[-1]["event_type"] == "REPRICED"
+
+
+def test_reprice_buy_order_does_not_chase_quote_beyond_bound() -> None:
+    repository = FakeRepository()
+    kis_client = FakeKISClient(
+        FakeSettings(),
+        asking_price={"output1": {"askp1": "102000", "bidp1": "101900"}},
+    )
+    service = OrderService(repository=repository, kis_client=kis_client)  # type: ignore[arg-type]
+
+    result = service.reprice_order(
+        _stored_order(
+            order_type="LIMIT",
+            price=100000,
+            status="SENT",
+            broker_order_no="00012345",
+        ),
+        anchor_price=100000,
+        max_deviation_pct=0.01,
+    )
+
+    assert result["action"] == "no_change"
+    assert result["price_bound"] == 101000
+    assert not kis_client.revisions
 
 
 def test_resubmit_order_blocks_already_sent_order() -> None:

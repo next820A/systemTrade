@@ -3,6 +3,7 @@ from decimal import Decimal
 from system_trade.account_records import (
     balance_summary_from_response,
     buying_power_from_response,
+    cancelable_rows_from_response,
     holding_rows_from_response,
     sellable_from_response,
 )
@@ -99,3 +100,28 @@ def test_sellable_from_kis_output() -> None:
     assert capacity["sellable_quantity"] == 7
     assert capacity["holding_quantity"] == 10
     assert capacity["current_price"] == Decimal("72000")
+
+
+def test_cancelable_rows_use_possible_quantity_and_order_branch_number() -> None:
+    payload = {
+        "output": [
+            {
+                "ord_gno_brno": "06010",
+                "odno": "00012345",
+                "orgn_odno": "00012000",
+                "pdno": "069500",
+                "ord_qty": "11",
+                "tot_ccld_qty": "5",
+                "psbl_qty": "6",
+                "ord_unpr": "104095",
+                "excg_id_dvsn_cd": "KRX",
+            }
+        ]
+    }
+
+    rows = cancelable_rows_from_response(payload)
+
+    assert rows[0]["broker_org_order_no"] == "06010"
+    assert rows[0]["original_broker_order_no"] == "00012000"
+    assert rows[0]["unfilled_quantity"] == 6
+    assert rows[0]["exchange_id"] == "KRX"
