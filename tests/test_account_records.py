@@ -1,9 +1,11 @@
+from datetime import datetime
 from decimal import Decimal
 
 from system_trade.account_records import (
     balance_summary_from_response,
     buying_power_from_response,
     cancelable_rows_from_response,
+    execution_rows_from_response,
     holding_rows_from_response,
     sellable_from_response,
 )
@@ -125,3 +127,29 @@ def test_cancelable_rows_use_possible_quantity_and_order_branch_number() -> None
     assert rows[0]["original_broker_order_no"] == "00012000"
     assert rows[0]["unfilled_quantity"] == 6
     assert rows[0]["exchange_id"] == "KRX"
+
+
+def test_execution_rows_parse_kis_order_time_as_utc() -> None:
+    payload = {
+        "output1": [
+            {
+                "ord_dt": "20260817",
+                "ord_tmd": "092532",
+                "odno": "0005743100",
+                "sll_buy_dvsn_cd_name": "현금매수",
+                "pdno": "062040",
+                "ord_qty": "3",
+                "tot_ccld_qty": "3",
+                "avg_prvs": "127300",
+                "tot_ccld_amt": "381900",
+            }
+        ]
+    }
+
+    rows = execution_rows_from_response(payload)
+
+    assert rows[0]["side"] == "BUY"
+    assert rows[0]["filled_quantity"] == 3
+    assert rows[0]["fill_price"] == Decimal("127300")
+    assert rows[0]["ordered_at"] == datetime(2026, 8, 17, 0, 25, 32)
+    assert rows[0]["filled_at"] == datetime(2026, 8, 17, 0, 25, 32)

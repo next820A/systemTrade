@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from zoneinfo import ZoneInfo
+
+
+KST = ZoneInfo("Asia/Seoul")
 
 
 def as_dict(value: Any) -> dict[str, Any]:
@@ -60,6 +65,19 @@ def side_or_none(value: Any) -> str | None:
     if upper in {"SELL", "1", "01"} or "매도" in text:
         return "SELL"
     return None
+
+
+def kis_datetime_or_none(date_value: Any, time_value: Any) -> datetime | None:
+    """Parse a KIS YYYYMMDD/HHMMSS timestamp into a naive UTC datetime for MySQL."""
+    date_text = clean_text(date_value)
+    time_text = clean_text(time_value)
+    if date_text is None or time_text is None:
+        return None
+    try:
+        local_value = datetime.strptime(f"{date_text}{time_text.zfill(6)}", "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    return local_value.replace(tzinfo=KST).astimezone(UTC).replace(tzinfo=None)
 
 
 def balance_summary_from_response(payload: dict[str, Any]) -> dict[str, Any]:
@@ -146,6 +164,10 @@ def cancelable_rows_from_response(payload: dict[str, Any]) -> list[dict[str, Any
 def execution_rows_from_response(payload: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
     for row in as_list(payload.get("output1")):
+        execution_time = kis_datetime_or_none(
+            pick(row, "ord_dt", "ORD_DT"),
+            pick(row, "ord_tmd", "ORD_TMD", "ord_time"),
+        )
         rows.append(
             {
                 "broker_order_no": clean_text(pick(row, "odno", "ODNO", "ord_no")),
@@ -156,6 +178,8 @@ def execution_rows_from_response(payload: dict[str, Any]) -> list[dict[str, Any]
                 "filled_quantity": int_or_none(pick(row, "tot_ccld_qty", "ccld_qty")),
                 "fill_price": decimal_or_none(pick(row, "avg_prvs", "ccld_unpr")),
                 "fill_amount": decimal_or_none(pick(row, "tot_ccld_amt", "ccld_amt")),
+                "ordered_at": execution_time,
+                "filled_at": execution_time,
                 "raw_payload": row,
             }
         )
