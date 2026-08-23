@@ -363,6 +363,52 @@ class OrderService:
             ],
         }
 
+    def finalize_closed_session(self, *, trade_date: date) -> dict[str, Any]:
+        settings = self._kis_client._settings
+        settings.require_account()
+        orders = self._repository.list_orders_for_account_trade_date(
+            account_no=str(settings.kis_account_no),
+            trade_date=trade_date,
+        )
+        finalized_order_ids: list[int] = []
+        finalized_at = _utcnow_naive()
+        for order in orders:
+            status = str(order.get("status") or "")
+            if status not in {
+                OrderStatus.SENT.value,
+                OrderStatus.PARTIALLY_FILLED.value,
+            }:
+                continue
+            order_id = int(order["id"])
+            remaining_quantity = max(
+                int(order.get("quantity") or 0) - int(order.get("filled_quantity") or 0),
+                0,
+            )
+            self._repository.update_order_status(
+                order_id,
+                OrderStatus.CANCELED,
+                remaining_quantity=remaining_quantity,
+                closed_at=finalized_at,
+                last_synced_at=finalized_at,
+                error_code=None,
+                error_message=None,
+            )
+            self._repository.insert_order_event(
+                order_id=order_id,
+                event_type="SESSION_EXPIRED",
+                status=OrderStatus.CANCELED,
+                request_payload=None,
+                response_payload={"remaining_quantity": remaining_quantity},
+                note="unfilled_remainder_after_closed_trade_date",
+                event_at=finalized_at,
+            )
+            finalized_order_ids.append(order_id)
+        return {
+            "trade_date": trade_date.isoformat(),
+            "account_alias": settings.account_alias,
+            "finalized_order_ids": finalized_order_ids,
+        }
+
     def reprice_order(
         self,
         order: dict[str, Any],
@@ -502,6 +548,94 @@ class OrderService:
             "anchor_price": anchor_price,
             "price_bound": price_bound,
             "marketable_quote_price": quote_price,
+            "remaining_quantity": remaining_quantity,
+            "order": refreshed,
+        }
+
+    def cancel_order(self, order: dict[str, Any]) -> dict[str, Any]:
+        settings = self._kis_client._settings
+        settings.require_account()
+        order_id = int(order["id"])
+        status = OrderStatus(str(order.get("status") or ""))
+        if status not in {OrderStatus.SENT, OrderStatus.PARTIALLY_FILLED}:
+            raise ConfigError(
+                "Only SENT/PARTIALLY_FILLED orders can be canceled. "
+                f"order_id={order_id}, status={status.value}"
+            )
+        if not order.get("broker_order_no"):
+            raise ConfigError(f"Order has no broker_order_no. order_id={order_id}")
+
+        side = Side(str(order["side"]))
+        cancelable_response = self._kis_client.get_cancelable_orders(
+            query_by="0",
+            side_filter="2" if side == Side.BUY else "1",
+        )
+        cancelable_order = next(
+            (
+                row
+                for row in cancelable_rows_from_response(cancelable_response)
+                if str(row.get("broker_order_no") or "") == str(order["broker_order_no"])
+            ),
+            None,
+        )
+        if cancelable_order is None:
+            return {
+                "action": "not_cancelable",
+                "order_id": order_id,
+                "side": side.value,
+                "symbol": order.get("symbol"),
+            }
+
+        remaining_quantity = int(cancelable_order.get("unfilled_quantity") or 0)
+        if remaining_quantity <= 0:
+            return {
+                "action": "no_remaining_quantity",
+                "order_id": order_id,
+                "side": side.value,
+                "symbol": order.get("symbol"),
+            }
+
+        response = self._kis_client.revise_or_cancel_order(
+            original_order_no=str(cancelable_order["broker_order_no"]),
+            revise_or_cancel_code="02",
+            quantity=remaining_quantity,
+            price=0,
+            order_type=OrderType(str(order["order_type"])),
+            exchange_id=str(cancelable_order.get("exchange_id") or "KRX"),
+            original_org_no=str(
+                cancelable_order.get("broker_org_order_no")
+                or order.get("broker_org_order_no")
+                or ""
+            ),
+            all_quantity=True,
+        )
+        canceled_at = _utcnow_naive()
+        self._repository.update_order_status(
+            order_id,
+            OrderStatus.CANCELED,
+            closed_at=canceled_at,
+            last_synced_at=canceled_at,
+            error_code=None,
+            error_message=None,
+        )
+        self._repository.insert_order_event(
+            order_id=order_id,
+            event_type="CANCELED",
+            status=OrderStatus.CANCELED,
+            request_payload={
+                "side": side.value,
+                "symbol": order.get("symbol"),
+                "remaining_quantity": remaining_quantity,
+                "broker_order_no": order.get("broker_order_no"),
+            },
+            response_payload=response,
+            note="cancel_unfilled_order",
+            event_at=canceled_at,
+        )
+        refreshed = self._repository.get_order_by_id(order_id) or {}
+        return {
+            "action": "canceled",
+            "order_id": order_id,
             "remaining_quantity": remaining_quantity,
             "order": refreshed,
         }

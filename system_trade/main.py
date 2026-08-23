@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
 
 import pymysql
 
@@ -399,6 +400,14 @@ def cmd_sync_orders(args: argparse.Namespace) -> int:
     ]
     repository.insert_broker_execution_snapshots(rows)
     result = service.sync_daily_executions(trade_date=trade_date, response=payload)
+    today_seoul = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    if trade_date < today_seoul:
+        finalize_result = service.finalize_closed_session(trade_date=trade_date)
+        result["closed_session_finalize"] = finalize_result
+        finalized_ids = {int(order_id) for order_id in finalize_result["finalized_order_ids"]}
+        for order in result["orders"]:
+            if int(order["id"]) in finalized_ids:
+                order["status"] = OrderStatus.CANCELED.value
     print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
     return 0
 
@@ -639,6 +648,35 @@ def cmd_reprice_order(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cancel_order(args: argparse.Namespace) -> int:
+    _, lookup_repository = _new_repository()
+    order = lookup_repository.get_order_by_id(args.order_id)
+    if not order:
+        raise ConfigError(f"order_id={args.order_id} not found.")
+
+    account_alias = str(order.get("account_alias") or "")
+    if not account_alias:
+        raise ConfigError(f"order_id={args.order_id} has no account_alias.")
+    if args.expected_trade_date and str(order.get("trade_date")) != args.expected_trade_date:
+        raise ConfigError(
+            f"order_id={args.order_id} trade_date={order.get('trade_date')} "
+            f"does not match expected {args.expected_trade_date}."
+        )
+
+    settings, _, repository, service = _new_order_stack(account_alias=account_alias)
+    settings.require_account()
+    if not settings.kis_paper and not args.allow_live:
+        raise ConfigError("Live order cancellation is blocked by default. Re-run with --allow-live if intended.")
+    repository.ping()
+
+    latest_order = repository.get_order_by_id(args.order_id)
+    if not latest_order:
+        raise ConfigError(f"order_id={args.order_id} not found.")
+    result = service.cancel_order(latest_order)
+    print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
+    return 0
+
+
 def _order_result_exit_code(order: dict[str, object], *, record_only: bool) -> int:
     if record_only:
         return 0
@@ -783,6 +821,12 @@ def build_parser() -> argparse.ArgumentParser:
     reprice.add_argument("--expected-trade-date", help="guardrail: require stored trade_date YYYY-MM-DD")
     reprice.add_argument("--allow-live", action="store_true")
     reprice.set_defaults(func=cmd_reprice_order)
+
+    cancel = sub.add_parser("cancel-order", help="cancel the unfilled remainder of a sent order")
+    cancel.add_argument("--order-id", type=int, required=True)
+    cancel.add_argument("--expected-trade-date", help="guardrail: require stored trade_date YYYY-MM-DD")
+    cancel.add_argument("--allow-live", action="store_true")
+    cancel.set_defaults(func=cmd_cancel_order)
 
     list_orders = sub.add_parser("list-orders", help="show recent orders")
     list_orders.add_argument("--limit", type=int, default=20)

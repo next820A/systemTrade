@@ -610,6 +610,30 @@ def test_sync_daily_executions_accumulates_fill_after_partial_order_reprice() ->
     assert float(repository.status_updates[0][2]["avg_fill_price"]) == pytest.approx(103890.9091)
 
 
+def test_finalize_closed_session_cancels_unfilled_remainder() -> None:
+    repository = FakeRepository()
+    repository.execution_orders = [
+        _stored_order(
+            id=57,
+            status="PARTIALLY_FILLED",
+            quantity=5,
+            filled_quantity=2,
+            broker_order_no="00012345",
+        )
+    ]
+    service = OrderService(  # type: ignore[arg-type]
+        repository=repository,
+        kis_client=FakeKISClient(FakeSettings()),
+    )
+
+    result = service.finalize_closed_session(trade_date=datetime(2026, 8, 19).date())
+
+    assert result["finalized_order_ids"] == [57]
+    assert repository.status_updates[-1][1] == OrderStatus.CANCELED
+    assert repository.status_updates[-1][2]["remaining_quantity"] == 3
+    assert repository.events[-1]["event_type"] == "SESSION_EXPIRED"
+
+
 def test_reprice_sell_order_moves_to_best_bid_within_bound() -> None:
     repository = FakeRepository()
     kis_client = FakeKISClient(
@@ -662,6 +686,71 @@ def test_reprice_sell_order_moves_to_best_bid_within_bound() -> None:
     ]
     assert repository.status_updates[-1][2]["broker_order_no"] == "54321"
     assert repository.events[-1]["event_type"] == "REPRICED"
+
+
+def test_cancel_order_cancels_only_the_unfilled_remainder() -> None:
+    repository = FakeRepository()
+    kis_client = FakeKISClient(
+        FakeSettings(),
+        cancelable_orders={
+            "output": [
+                {
+                    "ord_gno_brno": "06010",
+                    "odno": "00012345",
+                    "orgn_odno": "",
+                    "pdno": "069500",
+                    "psbl_qty": "2",
+                    "sll_buy_dvsn_cd": "01",
+                    "excg_id_dvsn_cd": "KRX",
+                }
+            ]
+        },
+    )
+    service = OrderService(repository=repository, kis_client=kis_client)  # type: ignore[arg-type]
+
+    result = service.cancel_order(
+        _stored_order(
+            side="SELL",
+            symbol="069500",
+            order_type="LIMIT",
+            quantity=2,
+            price=108550,
+            status="SENT",
+            broker_order_no="00012345",
+            broker_org_order_no="06010",
+        )
+    )
+
+    assert result["action"] == "canceled"
+    assert kis_client.revisions == [
+        {
+            "original_order_no": "00012345",
+            "revise_or_cancel_code": "02",
+            "quantity": 2,
+            "price": 0,
+            "order_type": OrderType.LIMIT,
+            "exchange_id": "KRX",
+            "original_org_no": "06010",
+            "all_quantity": True,
+        }
+    ]
+    assert repository.status_updates[-1][1] == OrderStatus.CANCELED
+    assert repository.events[-1]["event_type"] == "CANCELED"
+
+
+def test_cancel_order_leaves_status_when_broker_has_no_cancelable_remainder() -> None:
+    repository = FakeRepository()
+    service = OrderService(  # type: ignore[arg-type]
+        repository=repository,
+        kis_client=FakeKISClient(FakeSettings()),
+    )
+
+    result = service.cancel_order(
+        _stored_order(status="SENT", broker_order_no="00012345")
+    )
+
+    assert result["action"] == "not_cancelable"
+    assert not repository.status_updates
 
 
 def test_reprice_buy_order_does_not_chase_quote_beyond_bound() -> None:
