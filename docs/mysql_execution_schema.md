@@ -41,7 +41,7 @@ MySQL에 남기지 않는 것:
 
 `systemAlgo`는 매수 주문 의도를 생성할 때 가능하면 `LIMIT` 주문으로 넘긴다. `MARKET`은 체결 편의성은 높지만, 계좌별 주문가능금액이 부족한 경우 KIS에서 `APBK0952` 같은 거절이 발생하기 쉽고 재전송 시에도 같은 문제가 반복된다.
 
-ETF 파킹 자금을 개별주로 교체하는 운영 배치는 ETF와 전략 청산 주문을 먼저 `LIMIT`으로 제출한다. `sync-orders`가 KIS 일별 체결 결과를 `trade_orders.filled_quantity`, `remaining_quantity`, `avg_fill_price`, `status`에 반영하고, 관련 매도가 모두 `FILLED`가 된 뒤 잔고를 다시 저장한다. 갱신된 `cash_available`로 매수 수량을 다시 계산하기 전에는 후속 매수를 제출하지 않는다.
+ETF 파킹 자금을 개별주로 교체하는 운영 배치는 ETF와 전략 청산 주문을 먼저 `LIMIT`으로 제출한다. `sync-orders`가 KIS 일별 체결 결과를 `trade_orders.filled_quantity`, `remaining_quantity`, `avg_fill_price`, `status`에 반영하고, 관련 매도가 모두 `FILLED`가 된 뒤 후속 매수를 진행한다. 매도 직후 잔고는 반영이 늦을 수 있으므로 매수 직전 종목별 KIS 주문가능 조회를 기준으로 수량을 제한한다.
 
 미체결 지정가 주문은 KIS 정정취소가능수량(`psbl_qty`)을 확인한 뒤 정정 API로 가격만 변경한다. 매수는 최우선 매도호가, 매도는 최우선 매수호가를 사용하되 최초 지정가 기준 허용 범위를 넘는 호가는 추격하지 않는다. 정정 결과의 새 주문번호와 가격은 `trade_orders`에 반영하고 이전/새 가격, 기준가격, 허용범위, 최우선호가는 `trade_order_events`의 `REPRICED` 이벤트에 남긴다.
 
@@ -143,3 +143,17 @@ WHERE ta.broker = 'KIS'
 - 일별 주문/체결 조회: `output1` 체결/주문 list, `output2` summary dict
 
 정규화 테이블은 위 구조를 기준으로 best-effort 필드만 빼고, 원본 row/payload는 JSON으로 같이 저장한다.
+
+## 거부·취소 동기화와 수량 의미
+
+`sync-orders`는 체결량 증가뿐 아니라 KIS 거부 수량과 확정 취소 정보도 반영한다. 부분체결 뒤 잔량이 거부되거나 취소돼도 체결량과 평균가격은 보존한다. 취소 자식 주문은 KIS의 원주문번호로 연결하고, 취소 요청 자체가 거부된 경우에는 원주문을 거부 상태로 바꾸지 않는다.
+
+- `requested_quantity`: 최초 `CREATED` 이벤트의 요청 수량. 기존 이벤트가 없을 때는 intent의 목표 수량 또는 저장 수량을 사용한다.
+- `submitted_quantity`: 브로커에 제출한 수량. 수량 축소는 부분체결과 구분한다.
+- `filled_quantity`: 누적 체결 수량.
+- `remaining_quantity`: 제출 수량 중 미실행 수량. 취소·거부된 잔량도 포함한다.
+- `active_remaining_quantity`: 현재 열린 주문의 잔량. 최종 거부·취소·체결 상태에서는 0이다.
+
+브로커 동기화 상태와 감사 이벤트는 한 트랜잭션으로 저장하며, 조회 이후 주문 상태·수량·주문번호가 달라졌으면 덮어쓰지 않는다. 정정 후 누적 체결은 이벤트에 저장한 정정 전 수량을 기준으로 계산해 반복 조회의 중복 합산을 막는다. 이벤트에는 변경 전후 상태와 근거 `query_request_id`를 남긴다.
+
+지난 거래일이어도 조회에서 사라진 주문이나 의미가 불명확한 0주 체결 행은 자동 취소로 확정하지 않는다. 명시적으로 보고된 미체결 DAY 주문의 잔량만 세션 만료로 처리하고, 근거가 부족하면 `closed_session_finalize.review_order_ids`에 남긴다. 브로커의 상세 거부 사유가 없으면 이를 추정해 기록하지 않는다.

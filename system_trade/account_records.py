@@ -163,7 +163,9 @@ def cancelable_rows_from_response(payload: dict[str, Any]) -> list[dict[str, Any
 
 def execution_rows_from_response(payload: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
-    for row in as_list(payload.get("output1")):
+    for raw_row in as_list(payload.get("output1")):
+        row = {key.lower(): value for key, value in raw_row.items()}
+        description = clean_text(row.get("sll_buy_dvsn_cd_name")) or ""
         execution_time = kis_datetime_or_none(
             pick(row, "ord_dt", "ORD_DT"),
             pick(row, "ord_tmd", "ORD_TMD", "ord_time"),
@@ -171,16 +173,22 @@ def execution_rows_from_response(payload: dict[str, Any]) -> list[dict[str, Any]
         rows.append(
             {
                 "broker_order_no": clean_text(pick(row, "odno", "ODNO", "ord_no")),
+                "original_broker_order_no": clean_text(row.get("orgn_odno")),
+                "order_date": clean_text(row.get("ord_dt")),
                 "broker_fill_id": clean_text(pick(row, "ccld_no", "exec_no", "broker_fill_id")),
                 "side": side_or_none(pick(row, "sll_buy_dvsn_cd", "sll_buy_dvsn_cd_name")),
                 "symbol": clean_text(pick(row, "pdno", "PDNO")),
                 "order_quantity": int_or_none(pick(row, "ord_qty", "ORD_QTY")),
                 "filled_quantity": int_or_none(pick(row, "tot_ccld_qty", "ccld_qty")),
+                "rejected_quantity": int_or_none(row.get("rjct_qty")),
+                "remaining_quantity": int_or_none(row.get("rmn_qty")),
+                "is_cancel": "취소" in description or str(row.get("cncl_yn") or "").upper() == "Y",
+                "rejection_reason": clean_text(pick(row, "rjct_rson_name", "rjct_rson", "rjct_rson_cd")),
                 "fill_price": decimal_or_none(pick(row, "avg_prvs", "ccld_unpr")),
                 "fill_amount": decimal_or_none(pick(row, "tot_ccld_amt", "ccld_amt")),
                 "ordered_at": execution_time,
                 "filled_at": execution_time,
-                "raw_payload": row,
+                "raw_payload": raw_row,
             }
         )
     return rows

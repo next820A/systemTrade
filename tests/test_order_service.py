@@ -144,6 +144,18 @@ class FakeRepository:
     def list_orders_for_account_trade_date(self, **kwargs: Any) -> list[dict[str, Any]]:
         return self.execution_orders
 
+    def get_order_sync_progress(self, order_id: int, broker_order_no: str) -> dict[str, Any]:
+        for event in reversed(self.events):
+            payload = event.get("response_payload") or {}
+            if event["order_id"] == order_id and payload.get("broker_order_no") == broker_order_no and "base_filled_quantity" in payload:
+                return payload
+        return {}
+
+    def apply_order_sync(self, *, order_id: int, status: Any, updates: dict[str, Any], event: dict[str, Any], expected: dict[str, Any]) -> bool:
+        self.update_order_status(order_id, status, **updates)
+        self.insert_order_event(order_id=order_id, status=status, **event)
+        return True
+
 
 @pytest.fixture(autouse=True)
 def _disable_order_notifications(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -626,7 +638,10 @@ def test_finalize_closed_session_cancels_unfilled_remainder() -> None:
         kis_client=FakeKISClient(FakeSettings()),
     )
 
-    result = service.finalize_closed_session(trade_date=datetime(2026, 8, 19).date())
+    result = service.finalize_closed_session(
+        trade_date=datetime(2026, 8, 19).date(),
+        response={"output1": [{"odno": "00012345", "pdno": "005930", "rmn_qty": "3"}]},
+    )
 
     assert result["finalized_order_ids"] == [57]
     assert repository.status_updates[-1][1] == OrderStatus.CANCELED
@@ -811,3 +826,141 @@ def test_limit_order_without_price_is_rejected_before_db_write() -> None:
     assert repository.account_lookup is None
     assert repository.created_payload is None
     assert not kis_client.orders
+
+
+def _reconciliation_service(**overrides: Any) -> tuple[OrderService, FakeRepository, dict[str, Any]]:
+    order = _stored_order(
+        status="SENT", broker_order_no="0000091", quantity=2,
+        filled_quantity=0, remaining_quantity=None, **overrides,
+    )
+    repo = FakeRepository()
+    repo.execution_orders = [order]
+    return OrderService(repo, FakeKISClient(FakeSettings())), repo, order  # type: ignore[arg-type]
+
+
+def test_oct16_zero_fill_rejection_is_terminal_and_repeatable() -> None:
+    import json
+
+    service, repo, order = _reconciliation_service()
+    payload = {"rt_cd": "0", "output1": [{
+        "odno": "0000091", "pdno": "005930", "ord_qty": "2",
+        "tot_ccld_qty": "0", "rjct_qty": "2", "rmn_qty": "0",
+    }]}
+    result = service.sync_daily_executions(trade_date=datetime(2026, 10, 16).date(), response=payload)
+    assert order["status"] == "REJECTED"
+    assert order["filled_quantity"] == 0
+    assert order["closed_at"] is not None
+    assert order["error_code"] == "BROKER_REJECTED"
+    assert result["orders"][0]["active_remaining_quantity"] == 0
+    assert repo.events[0]["request_payload"]["before"]["status"] == "SENT"
+    assert repo.events[0]["response_payload"]["after"]["status"] == "REJECTED"
+    json.dumps(repo.events[0]["response_payload"])
+    repeated = service.sync_daily_executions(trade_date=datetime(2026, 10, 16).date(), response=payload)
+    assert repeated["synced_order_ids"] == []
+    assert len(repo.events) == 1
+    final = service.finalize_closed_session(trade_date=datetime(2026, 10, 16).date(), response=payload)
+    assert final["finalized_order_ids"] == []
+    assert order["status"] == "REJECTED"
+
+
+@pytest.mark.parametrize("terminal", ["reject", "cancel"])
+def test_partial_fill_terminal_remainder_preserves_execution(terminal: str) -> None:
+    service, repo, order = _reconciliation_service()
+    order.update(quantity=5, filled_quantity=2, status="PARTIALLY_FILLED", avg_fill_price="208000")
+    row = {"odno": "0000091", "pdno": "005930", "ord_qty": "5", "tot_ccld_qty": "2", "rmn_qty": "0"}
+    if terminal == "reject":
+        row["rjct_qty"] = "3"
+    else:
+        row.update(odno="0000092", orgn_odno="0000091", ord_qty="3", tot_ccld_qty="0", sll_buy_dvsn_cd_name="매수취소*")
+    response = {"output1": [row]}
+    service.sync_daily_executions(trade_date=datetime(2026, 10, 16).date(), response=response)
+    assert order["status"] == ("REJECTED" if terminal == "reject" else "CANCELED")
+    assert order["filled_quantity"] == 2
+    assert order["avg_fill_price"] == "208000"
+    assert order["remaining_quantity"] == 3
+    assert len(repo.events) == 1
+    service.sync_daily_executions(trade_date=datetime(2026, 10, 16).date(), response=response)
+    assert len(repo.events) == 1
+
+
+def test_partial_cancel_and_rejected_cancel_do_not_close_the_order() -> None:
+    service, repo, order = _reconciliation_service()
+    for row in [
+        {"odno": "0000092", "orgn_odno": "0000091", "sll_buy_dvsn_cd_name": "매수취소*", "rmn_qty": "1", "rjct_qty": "0"},
+        {"odno": "0000092", "orgn_odno": "0000091", "sll_buy_dvsn_cd_name": "매수취소*", "rmn_qty": "0", "rjct_qty": "2"},
+    ]:
+        service.sync_daily_executions(trade_date=datetime(2026, 10, 16).date(), response={"output1": [{**row, "pdno": "005930"}]})
+    assert order["status"] == "SENT"
+    assert not repo.events
+
+
+@pytest.mark.parametrize("payload", [None, {"output1": []}, {"rt_cd": "1", "output1": []}, {"output1": [{"odno": "0000091", "pdno": "005930", "rmn_qty": "0", "tot_ccld_qty": "0"}]}])
+def test_closed_session_leaves_missing_or_ambiguous_order_for_review(payload: Any) -> None:
+    service, repo, order = _reconciliation_service()
+    result = service.finalize_closed_session(trade_date=datetime(2026, 10, 16).date(), response=payload)
+    assert result["finalized_order_ids"] == []
+    assert result["review_order_ids"] == [order["id"]]
+    assert order["status"] == "SENT"
+    assert not repo.events
+
+
+def test_failed_execution_query_does_not_change_ledger() -> None:
+    service, repo, _ = _reconciliation_service()
+    with pytest.raises(ConfigError, match="successful daily execution response"):
+        service.sync_daily_executions(trade_date=datetime(2026, 10, 16).date(), response={"rt_cd": "1", "output1": []})
+    assert not repo.status_updates
+
+
+def test_revised_partial_fills_are_cumulative_and_idempotent() -> None:
+    service, repo, order = _reconciliation_service()
+    order.update(quantity=11, filled_quantity=5, avg_fill_price="104000", status="PARTIALLY_FILLED")
+    for reported, expected in [(2, 7), (2, 7), (5, 10), (6, 11), (6, 11)]:
+        result = service.sync_daily_executions(trade_date=datetime(2026, 10, 16).date(), response={"output1": [{
+            "odno": "0000091", "pdno": "005930", "ord_qty": "6",
+            "tot_ccld_qty": str(reported), "avg_prvs": "103800",
+        }]})
+        assert result["orders"][0]["filled_quantity"] == expected
+    assert len(repo.events) == 3
+    assert order["status"] == "FILLED"
+    assert float(order["avg_fill_price"]) == pytest.approx((5 * 104000 + 6 * 103800) / 11)
+
+
+def test_target_submission_and_fill_quantities_are_reported_separately() -> None:
+    service, _, order = _reconciliation_service()
+    order.update(requested_quantity="9", filled_quantity=0)
+    summary = service._execution_summary(order)
+    assert (summary["requested_quantity"], summary["submitted_quantity"], summary["filled_quantity"]) == (9, 2, 0)
+
+
+def test_canceled_parent_snapshot_can_report_a_previously_unseen_fill() -> None:
+    service, _, order = _reconciliation_service()
+    service.sync_daily_executions(trade_date=datetime(2026, 10, 16).date(), response={"output1": [{
+        "odno": "0000091", "pdno": "005930", "ord_qty": "2", "tot_ccld_qty": "1",
+        "avg_prvs": "208000", "rmn_qty": "0", "cncl_yn": "Y",
+    }]})
+    assert order["status"] == "CANCELED"
+    assert order["filled_quantity"] == 1
+    assert order["remaining_quantity"] == 1
+    assert order["avg_fill_price"] is not None
+
+
+def test_same_order_number_from_another_date_is_not_reconciled() -> None:
+    service, repo, _ = _reconciliation_service()
+    service.sync_daily_executions(trade_date=datetime(2026, 10, 16).date(), response={"output1": [{
+        "odno": "0000091", "pdno": "005930", "ord_dt": "20261015", "ord_tmd": "090040",
+        "ord_qty": "2", "tot_ccld_qty": "0", "rjct_qty": "2", "rmn_qty": "0",
+    }]})
+    assert not repo.events
+
+
+def test_rejected_remainder_with_zero_reported_fills_keeps_known_executions() -> None:
+    service, _, order = _reconciliation_service()
+    order.update(quantity=5, filled_quantity=2, avg_fill_price="208000", status="PARTIALLY_FILLED")
+    service.sync_daily_executions(trade_date=datetime(2026, 10, 16).date(), response={"output1": [{
+        "odno": "0000091", "pdno": "005930", "ord_qty": "5", "tot_ccld_qty": "0",
+        "rjct_qty": "3", "rmn_qty": "0",
+    }]})
+    assert order["status"] == "REJECTED"
+    assert order["filled_quantity"] == 2
+    assert order["avg_fill_price"] == "208000"
+    assert order["remaining_quantity"] == 3

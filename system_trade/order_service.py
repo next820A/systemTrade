@@ -262,6 +262,7 @@ class OrderService:
         *,
         trade_date: date,
         response: dict[str, Any],
+        query_request_id: int | None = None,
     ) -> dict[str, Any]:
         settings = self._kis_client._settings
         settings.require_account()
@@ -275,138 +276,219 @@ class OrderService:
             if order.get("broker_order_no")
         }
 
+        if response.get("rt_cd", "0") != "0" or not isinstance(response.get("output1"), list):
+            raise ConfigError("A successful daily execution response is required for reconciliation.")
+
         synced_order_ids: set[int] = set()
         for execution in execution_rows_from_response(response):
+            if execution.get("order_date") and execution["order_date"] != trade_date.strftime("%Y%m%d"):
+                continue
             broker_order_no = str(execution.get("broker_order_no") or "")
             order = orders_by_broker_no.get(broker_order_no)
-            if order is None:
+            # A confirmed cancellation has its own order number. Link it only by
+            # the broker's explicit original number, never by symbol alone.
+            if order is None and execution.get("is_cancel"):
+                order = orders_by_broker_no.get(str(execution.get("original_broker_order_no") or ""))
+            if order is None or (execution.get("symbol") and execution["symbol"] != order.get("symbol")):
+                continue
+            is_cancel = bool(execution.get("is_cancel"))
+            is_cancel_child = is_cancel and broker_order_no != str(order.get("broker_order_no"))
+            rejected_quantity = max(int(execution.get("rejected_quantity") or 0), 0)
+            # Rejecting a cancel request does not reject the underlying order.
+            if is_cancel and rejected_quantity:
                 continue
 
-            ordered_quantity = int(order.get("quantity") or execution.get("order_quantity") or 0)
+            order_id = int(order["id"])
+            ordered_quantity = int(order.get("quantity") or 0)
+            if ordered_quantity <= 0:
+                continue
             existing_filled_quantity = int(order.get("filled_quantity") or 0)
             reported_filled_quantity = max(int(execution.get("filled_quantity") or 0), 0)
             reported_order_quantity = int(execution.get("order_quantity") or 0)
-            revision_remaining_quantity = max(ordered_quantity - existing_filled_quantity, 0)
-            is_remaining_quantity_revision = (
+            progress = self._repository.get_order_sync_progress(order_id, broker_order_no)
+            base_quantity = int(progress.get("base_filled_quantity") or 0)
+            base_avg_price = progress.get("base_avg_fill_price")
+            if not progress and not is_cancel and (
                 existing_filled_quantity > 0
-                and reported_order_quantity > 0
-                and reported_order_quantity <= revision_remaining_quantity
+                and 0 < reported_order_quantity <= ordered_quantity - existing_filled_quantity
+            ):
+                base_quantity = existing_filled_quantity
+                base_avg_price = order.get("avg_fill_price")
+            filled_quantity = min(base_quantity + reported_filled_quantity, ordered_quantity)
+            if is_cancel_child:
+                filled_quantity = existing_filled_quantity
+            if filled_quantity < existing_filled_quantity:
+                confirms_closed_remainder = execution.get("remaining_quantity") == 0 and (
+                    is_cancel or rejected_quantity >= max(ordered_quantity - existing_filled_quantity, 1)
+                )
+                if not confirms_closed_remainder:
+                    continue
+                # A terminal remainder may report no fills of its own. Preserve
+                # executions already known from previous broker responses.
+                filled_quantity = existing_filled_quantity
+            advanced = filled_quantity > existing_filled_quantity
+            avg_fill_price = order.get("avg_fill_price")
+            if advanced:
+                avg_fill_price = execution.get("fill_price")
+                if base_quantity:
+                    avg_fill_price = _weighted_avg_fill_price(
+                        existing_quantity=base_quantity,
+                        existing_avg_price=base_avg_price,
+                        new_quantity=reported_filled_quantity,
+                        new_avg_price=execution.get("fill_price"),
+                    )
+
+            broker_remaining = execution.get("remaining_quantity")
+            confirmed_rejected = not is_cancel and rejected_quantity > 0 and (
+                broker_remaining == 0
+                or (broker_remaining is None and rejected_quantity >= max(reported_order_quantity - reported_filled_quantity, 1))
             )
-            filled_quantity = min(
-                existing_filled_quantity + reported_filled_quantity
-                if is_remaining_quantity_revision
-                else reported_filled_quantity,
-                ordered_quantity,
+            confirmed_canceled = is_cancel and broker_remaining == 0
+            status = status_from_fill(ordered_quantity, filled_quantity)
+            if filled_quantity < ordered_quantity:
+                if confirmed_rejected:
+                    status = OrderStatus.REJECTED
+                elif confirmed_canceled:
+                    status = OrderStatus.CANCELED
+                elif str(order.get("status")) in {"FILLED", "CANCELED", "REJECTED", "FAILED"}:
+                    status = OrderStatus(str(order["status"]))
+            needs_terminal_details = (confirmed_rejected or confirmed_canceled) and (
+                order.get("remaining_quantity") != max(ordered_quantity - filled_quantity, 0)
+                or order.get("closed_at") is None
             )
-            if ordered_quantity <= 0 or filled_quantity <= existing_filled_quantity:
+            if not advanced and status.value == str(order.get("status")) and not needs_terminal_details:
+                continue
+            # A zero-fill row without explicit terminal evidence is not proof
+            # that an order was canceled, rejected, or even accepted.
+            if not advanced and not (confirmed_rejected or confirmed_canceled):
                 continue
 
-            status = status_from_fill(ordered_quantity, filled_quantity)
-            remaining_quantity = max(ordered_quantity - filled_quantity, 0)
-            avg_fill_price = execution.get("fill_price")
-            if is_remaining_quantity_revision:
-                avg_fill_price = _weighted_avg_fill_price(
-                    existing_quantity=existing_filled_quantity,
-                    existing_avg_price=order.get("avg_fill_price"),
-                    new_quantity=reported_filled_quantity,
-                    new_avg_price=execution.get("fill_price"),
-                )
+            terminal = status in {OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED}
             synced_at = _utcnow_naive()
-            self._repository.update_order_status(
-                int(order["id"]),
-                status,
-                filled_quantity=filled_quantity,
-                remaining_quantity=remaining_quantity,
-                avg_fill_price=avg_fill_price,
-                closed_at=synced_at if status == OrderStatus.FILLED else None,
-                last_synced_at=synced_at,
-                error_code=None,
-                error_message=None,
-            )
-            self._repository.insert_order_event(
-                order_id=int(order["id"]),
-                event_type="FILL_SYNCED",
-                status=status,
-                request_payload=None,
+            error_code = order.get("error_code") if status == OrderStatus.REJECTED else None
+            error_message = order.get("error_message") if status == OrderStatus.REJECTED else None
+            if confirmed_rejected:
+                error_code = "BROKER_REJECTED"
+                error_message = execution.get("rejection_reason") or "KIS daily execution reports rejected quantity; detailed reason unavailable"
+            updates = {
+                "filled_quantity": filled_quantity,
+                "remaining_quantity": max(ordered_quantity - filled_quantity, 0),
+                "avg_fill_price": avg_fill_price,
+                "closed_at": (order.get("closed_at") or synced_at) if terminal else None,
+                "last_synced_at": synced_at,
+                "error_code": error_code,
+                "error_message": error_message,
+            }
+            before = {key: _json_scalar(order.get(key)) for key in ("status", "filled_quantity", "remaining_quantity", "avg_fill_price", "closed_at", "error_code", "error_message")}
+            event = dict(
+                event_type="FILL_SYNCED" if advanced and not (confirmed_rejected or confirmed_canceled) else "BROKER_STATE_SYNCED",
+                request_payload={"before": before},
                 response_payload={
+                    "query_request_id": query_request_id,
+                    "trade_date": trade_date.isoformat(),
                     "broker_order_no": broker_order_no,
+                    "original_broker_order_no": execution.get("original_broker_order_no"),
                     "broker_fill_id": execution.get("broker_fill_id"),
                     "filled_quantity": filled_quantity,
-                    "fill_price": _json_scalar(execution.get("fill_price")),
+                    "reported_filled_quantity": reported_filled_quantity,
+                    "rejected_quantity": rejected_quantity,
+                    "broker_remaining_quantity": broker_remaining,
+                    "is_cancel": is_cancel,
+                    "base_filled_quantity": base_quantity,
+                    "base_avg_fill_price": _json_scalar(base_avg_price),
+                    "fill_price": _json_scalar(avg_fill_price),
                     "fill_amount": _json_scalar(execution.get("fill_amount")),
+                    "after": {"status": status.value, **{key: _json_scalar(value) for key, value in updates.items()}},
                 },
                 note="daily_execution_sync",
                 event_at=synced_at,
             )
-            synced_order_ids.add(int(order["id"]))
+            applied = self._repository.apply_order_sync(
+                order_id=order_id, status=status, updates=updates, event=event,
+                expected={key: order.get(key) for key in ("status", "quantity", "filled_quantity", "broker_order_no")},
+            )
+            if applied:
+                order.update(updates, status=status.value)
+                synced_order_ids.add(order_id)
 
         refreshed_orders = self._repository.list_orders_for_account_trade_date(
-            account_no=str(settings.kis_account_no),
-            trade_date=trade_date,
+            account_no=str(settings.kis_account_no), trade_date=trade_date,
         )
         return {
             "trade_date": trade_date.isoformat(),
             "account_alias": settings.account_alias,
             "synced_order_ids": sorted(synced_order_ids),
-            "orders": [
-                {
-                    "id": int(order["id"]),
-                    "broker_order_no": order.get("broker_order_no"),
-                    "side": order.get("side"),
-                    "symbol": order.get("symbol"),
-                    "quantity": int(order.get("quantity") or 0),
-                    "filled_quantity": int(order.get("filled_quantity") or 0),
-                    "remaining_quantity": order.get("remaining_quantity"),
-                    "status": order.get("status"),
-                }
-                for order in refreshed_orders
-            ],
+            "orders": [self._execution_summary(order) for order in refreshed_orders],
         }
 
-    def finalize_closed_session(self, *, trade_date: date) -> dict[str, Any]:
+    @staticmethod
+    def _execution_summary(order: dict[str, Any]) -> dict[str, Any]:
+        quantity = int(order.get("quantity") or 0)
+        filled = int(order.get("filled_quantity") or 0)
+        metadata = _json_object_or_none(order.get("intent_metadata")) or {}
+        status = str(order.get("status") or "")
+        return {
+            "id": int(order["id"]),
+            "broker_order_no": order.get("broker_order_no"),
+            "side": order.get("side"),
+            "symbol": order.get("symbol"),
+            "quantity": quantity,
+            "requested_quantity": int(order.get("requested_quantity") or metadata.get("target_quantity") or quantity),
+            "submitted_quantity": quantity if order.get("broker_order_no") else 0,
+            "filled_quantity": filled,
+            # remaining_quantity records the unexecuted portion, including a
+            # canceled/rejected remainder. It is not an active broker order.
+            "remaining_quantity": order.get("remaining_quantity"),
+            "active_remaining_quantity": max(quantity - filled, 0) if status in {"SENT", "PARTIALLY_FILLED"} else 0,
+            "status": status,
+            "error_code": order.get("error_code"),
+            "error_message": order.get("error_message"),
+        }
+
+    def finalize_closed_session(self, *, trade_date: date, response: dict[str, Any] | None = None) -> dict[str, Any]:
         settings = self._kis_client._settings
         settings.require_account()
         orders = self._repository.list_orders_for_account_trade_date(
-            account_no=str(settings.kis_account_no),
-            trade_date=trade_date,
+            account_no=str(settings.kis_account_no), trade_date=trade_date,
         )
+        # Only an explicitly reported open remainder of the closed DAY session
+        # can expire. Missing/ambiguous rows require another broker query.
+        executions = execution_rows_from_response(response) if response and response.get("rt_cd", "0") == "0" else []
+        reported_open = {
+            str(row["broker_order_no"]): row for row in executions
+            if row.get("broker_order_no") and not row.get("is_cancel")
+            and (not row.get("order_date") or row["order_date"] == trade_date.strftime("%Y%m%d"))
+            and row.get("remaining_quantity") is not None
+            and int(row["remaining_quantity"]) > 0
+            and not row.get("rejected_quantity")
+        }
         finalized_order_ids: list[int] = []
+        review_order_ids: list[int] = []
         finalized_at = _utcnow_naive()
         for order in orders:
-            status = str(order.get("status") or "")
-            if status not in {
-                OrderStatus.SENT.value,
-                OrderStatus.PARTIALLY_FILLED.value,
-            }:
+            if str(order.get("status")) not in {"SENT", "PARTIALLY_FILLED"}:
                 continue
             order_id = int(order["id"])
-            remaining_quantity = max(
-                int(order.get("quantity") or 0) - int(order.get("filled_quantity") or 0),
-                0,
+            evidence = reported_open.get(str(order.get("broker_order_no") or ""))
+            if not evidence or evidence.get("symbol") != order.get("symbol"):
+                review_order_ids.append(order_id)
+                continue
+            remaining_quantity = max(int(order.get("quantity") or 0) - int(order.get("filled_quantity") or 0), 0)
+            applied = self._repository.apply_order_sync(
+                order_id=order_id, status=OrderStatus.CANCELED,
+                updates={"remaining_quantity": remaining_quantity, "closed_at": finalized_at, "last_synced_at": finalized_at, "error_code": None, "error_message": None},
+                event={
+                    "event_type": "SESSION_EXPIRED",
+                    "request_payload": {"before_status": order.get("status")},
+                    "response_payload": {"remaining_quantity": remaining_quantity, "broker_remaining_quantity": evidence["remaining_quantity"]},
+                    "note": "broker_reported_remainder_after_closed_day_session", "event_at": finalized_at,
+                },
+                expected={key: order.get(key) for key in ("status", "quantity", "filled_quantity", "broker_order_no")},
             )
-            self._repository.update_order_status(
-                order_id,
-                OrderStatus.CANCELED,
-                remaining_quantity=remaining_quantity,
-                closed_at=finalized_at,
-                last_synced_at=finalized_at,
-                error_code=None,
-                error_message=None,
-            )
-            self._repository.insert_order_event(
-                order_id=order_id,
-                event_type="SESSION_EXPIRED",
-                status=OrderStatus.CANCELED,
-                request_payload=None,
-                response_payload={"remaining_quantity": remaining_quantity},
-                note="unfilled_remainder_after_closed_trade_date",
-                event_at=finalized_at,
-            )
-            finalized_order_ids.append(order_id)
+            (finalized_order_ids if applied else review_order_ids).append(order_id)
         return {
-            "trade_date": trade_date.isoformat(),
-            "account_alias": settings.account_alias,
-            "finalized_order_ids": finalized_order_ids,
+            "trade_date": trade_date.isoformat(), "account_alias": settings.account_alias,
+            "finalized_order_ids": finalized_order_ids, "review_order_ids": review_order_ids,
         }
 
     def reprice_order(
@@ -998,4 +1080,6 @@ def _weighted_avg_fill_price(
 def _json_scalar(value: Any) -> Any:
     if isinstance(value, Decimal):
         return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
     return value

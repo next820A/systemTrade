@@ -399,15 +399,16 @@ def cmd_sync_orders(args: argparse.Namespace) -> int:
         for row in execution_rows_from_response(payload)
     ]
     repository.insert_broker_execution_snapshots(rows)
-    result = service.sync_daily_executions(trade_date=trade_date, response=payload)
+    result = service.sync_daily_executions(trade_date=trade_date, response=payload, query_request_id=query_request_id)
     today_seoul = datetime.now(ZoneInfo("Asia/Seoul")).date()
     if trade_date < today_seoul:
-        finalize_result = service.finalize_closed_session(trade_date=trade_date)
+        finalize_result = service.finalize_closed_session(trade_date=trade_date, response=payload)
         result["closed_session_finalize"] = finalize_result
         finalized_ids = {int(order_id) for order_id in finalize_result["finalized_order_ids"]}
         for order in result["orders"]:
             if int(order["id"]) in finalized_ids:
                 order["status"] = OrderStatus.CANCELED.value
+                order["active_remaining_quantity"] = 0
     print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
     return 0
 

@@ -153,3 +153,15 @@ def test_execution_rows_parse_kis_order_time_as_utc() -> None:
     assert rows[0]["fill_price"] == Decimal("127300")
     assert rows[0]["ordered_at"] == datetime(2026, 8, 17, 0, 25, 32)
     assert rows[0]["filled_at"] == datetime(2026, 8, 17, 0, 25, 32)
+
+
+def test_execution_rows_normalize_rejection_and_cancel_evidence_with_uppercase_keys() -> None:
+    rows = execution_rows_from_response({"output1": [
+        {"ODNO": "91", "PDNO": "005930", "RJCT_QTY": "2", "RMN_QTY": "0", "TOT_CCLD_QTY": "0", "RJCT_RSON_NAME": "거부 사유"},
+        {"odno": "84", "orgn_odno": "83", "pdno": "267250", "sll_buy_dvsn_cd_name": "매수취소*", "rmn_qty": "0"},
+    ]})
+    assert rows[0]["rejected_quantity"] == 2
+    assert rows[0]["remaining_quantity"] == 0
+    assert rows[0]["rejection_reason"] == "거부 사유"
+    assert rows[1]["is_cancel"] is True
+    assert rows[1]["original_broker_order_no"] == "83"

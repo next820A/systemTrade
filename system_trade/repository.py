@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterator
@@ -309,13 +309,18 @@ class MySQLRepository:
         trade_date: date,
     ) -> list[dict[str, Any]]:
         sql = """
-        SELECT *
-        FROM trade_orders
-        WHERE broker = 'KIS'
-          AND account_no = %s
-          AND trade_date = %s
-          AND broker_order_no IS NOT NULL
-        ORDER BY id
+        SELECT orders.*, (
+            SELECT JSON_UNQUOTE(JSON_EXTRACT(events.request_payload, '$.quantity'))
+            FROM trade_order_events events
+            WHERE events.order_id = orders.id AND events.event_type = 'CREATED'
+            ORDER BY events.id LIMIT 1
+        ) AS requested_quantity
+        FROM trade_orders orders
+        WHERE orders.broker = 'KIS'
+          AND orders.account_no = %s
+          AND orders.trade_date = %s
+          AND orders.broker_order_no IS NOT NULL
+        ORDER BY orders.id
         """
         with self._conn() as conn:
             with conn.cursor() as cursor:
@@ -391,7 +396,25 @@ class MySQLRepository:
             conn.commit()
         return int(order_id)
 
-    def update_order_status(self, order_id: int, status: OrderStatus, **updates: Any) -> None:
+    def get_order_sync_progress(self, order_id: int, broker_order_no: str) -> dict[str, Any]:
+        """Recover the fixed pre-revision fill base; broker quantities are cumulative."""
+        with self._conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT response_payload FROM trade_order_events
+                    WHERE order_id = %s
+                      AND event_type IN ('FILL_SYNCED', 'BROKER_STATE_SYNCED')
+                      AND JSON_UNQUOTE(JSON_EXTRACT(response_payload, '$.broker_order_no')) = %s
+                      AND JSON_EXTRACT(response_payload, '$.base_filled_quantity') IS NOT NULL
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (order_id, broker_order_no),
+                )
+                row = cursor.fetchone()
+        return json.loads(row["response_payload"]) if row else {}
+
+    def update_order_status(self, order_id: int, status: OrderStatus, *, _connection: Any = None, **updates: Any) -> None:
         allowed_keys = {
             "broker_order_no",
             "broker_org_order_no",
@@ -418,10 +441,31 @@ class MySQLRepository:
         params.append(order_id)
         sql = f"UPDATE trade_orders SET {', '.join(set_clauses)} WHERE id = %s"
 
-        with self._conn() as conn:
+        with (self._conn() if _connection is None else nullcontext(_connection)) as conn:
             with conn.cursor() as cursor:
                 cursor.execute(sql, params)
+            if _connection is None:
+                conn.commit()
+
+    def apply_order_sync(
+        self, *, order_id: int, status: OrderStatus, updates: dict[str, Any],
+        event: dict[str, Any], expected: dict[str, Any],
+    ) -> bool:
+        """Commit broker progress and its audit event together, without overwriting a concurrent update."""
+        with self._conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT status, quantity, filled_quantity, broker_order_no FROM trade_orders WHERE id = %s FOR UPDATE",
+                    (order_id,),
+                )
+                current = cursor.fetchone()
+            if not current or any(str(current.get(key)) != str(expected.get(key)) for key in current):
+                conn.rollback()
+                return False
+            self.update_order_status(order_id, status, _connection=conn, **updates)
+            self.insert_order_event(order_id=order_id, status=status, _connection=conn, **event)
             conn.commit()
+        return True
 
     def insert_order_event(
         self,
@@ -432,6 +476,7 @@ class MySQLRepository:
         response_payload: dict[str, Any] | None,
         note: str | None,
         event_at: datetime,
+        _connection: Any = None,
     ) -> None:
         sql = """
         INSERT INTO trade_order_events (
@@ -454,10 +499,11 @@ class MySQLRepository:
             event_at,
         )
 
-        with self._conn() as conn:
+        with (self._conn() if _connection is None else nullcontext(_connection)) as conn:
             with conn.cursor() as cursor:
                 cursor.execute(sql, params)
-            conn.commit()
+            if _connection is None:
+                conn.commit()
 
     def create_account_query_request(self, payload: dict[str, Any]) -> int:
         sql = """
